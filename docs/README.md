@@ -32,66 +32,21 @@ That design lets us experiment with Qwen, KV compression, and TurboQuant without
 
 ### Request path
 
-```mermaid
-sequenceDiagram
-  participant OC as "the app (Mac)"
-  participant WG as "wingpu"
-  participant SSH as "SSH tunnel"
-  participant WIN as "Windows host"
-  participant WSL as "WSL Ubuntu"
-  participant LLM as "llama-server"
-  participant GPU as "NVIDIA GPU"
-
-  OC->>SSH: HTTP request to 127.0.0.1:8000/v1
-  SSH->>WIN: Forwarded over SSH
-  WIN->>WSL: Enter WSL runtime
-  WSL->>LLM: Deliver request to llama-server
-  LLM->>GPU: Run prompt/decode kernels
-  GPU-->>LLM: Tokens and logits
-  LLM-->>OC: OpenAI-compatible response
+```text
++-------------------+      SSH tunnel      +-------------------+      WSL entry      +-------------------+
+| the app on Mac   | -------------------> | Windows OpenSSH   | ------------------> | WSL Ubuntu        |
++---------+---------+                      +---------+---------+                     +---------+---------+
+          ^                                          |                                         |
+          |                                          |                                         |
+          | OpenAI-compatible response               |                                         |
+          |                                          v                                         v
+          |                                +---------+---------+                     +---------+---------+
+          +------------------------------- | local forwarded   | <------------------ | llama-server       |
+                                           | port 127.0.0.1    |    prompt/decode    | on NVIDIA GPU      |
+                                           +-------------------+                     +-------------------+
 ```
 
 ### Component map
-
-```mermaid
-flowchart TB
-  subgraph Mac["macOS"]
-    CLI["wingpu\nPython + uv"]
-    APP["the app"]
-    STATE["Local state\n~/.gpu-chat-bridge"]
-    CFG["Project config\nbridge/config/wingpu.local.toml"]
-  end
-
-  subgraph Windows["Windows host"]
-    SSHD["OpenSSH Server"]
-    WSLA["WSL launcher"]
-    WINSET["Startup and firewall scripts"]
-  end
-
-  subgraph Ubuntu["WSL Ubuntu"]
-    LANE["Runtime lane\nupstream or turboquant-cuda"]
-    SERVER["llama-server"]
-    BENCH["llama-bench"]
-    MODELS["GGUF model store"]
-  end
-
-  GPU["NVIDIA GPU"]
-
-  CLI --> CFG
-  CLI --> STATE
-  CLI --> SSHD
-  APP --> SSHD
-  SSHD --> WSLA
-  WSLA --> LANE
-  LANE --> SERVER
-  LANE --> BENCH
-  SERVER --> MODELS
-  SERVER --> GPU
-  BENCH --> GPU
-  WINSET --> SSHD
-```
-
-Plain-text version:
 
 ```text
 +----------------------------- macOS -----------------------------+

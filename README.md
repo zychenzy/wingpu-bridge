@@ -18,17 +18,6 @@ The published project keeps one stable app contract:
 
 ## System Shape
 
-```mermaid
-flowchart LR
-  Mac["macOS\nwingpu\nthe app"] -->|SSH control + tunnel| Win["Windows host\nOpenSSH + WSL"]
-  Win --> WSL["WSL Ubuntu\nllama-server"]
-  WSL --> GPU["NVIDIA GPU"]
-  OpenAI["Local API\n127.0.0.1:8000/v1"] --> Mac
-  WSL --> OpenAI
-```
-
-Plain-text version:
-
 ```text
 +-----------------------+        SSH control + tunnel        +----------------------+
 | macOS                 | ---------------------------------> | Windows host         |
