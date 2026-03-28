@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import posixpath
 import shlex
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import tomllib
+import urllib.error
 import urllib.request
 from importlib import resources as importlib_resources
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +69,18 @@ class RuntimeDefaults:
 
 
 @dataclass(slots=True)
+class GatewayConfig:
+    listen_host: str = "127.0.0.1"
+    backend_host: str = "127.0.0.1"
+    backend_local_port: int = 18000
+    idle_offload_enabled: bool = True
+    idle_timeout_seconds: int = 1800
+    idle_poll_seconds: int = 5
+    request_timeout_seconds: int = 1800
+    restart_mode: str = "on_demand"
+
+
+@dataclass(slots=True)
 class PathsConfig:
     remote_home: str = "/home/your-wsl-user"
     remote_src_root: str = "/home/your-wsl-user/src"
@@ -92,6 +109,10 @@ class StateConfig:
     selected_cache_type_v_file: str = "selected_cache_type_v"
     benchmark_dir_name: str = "benchmarks"
     restart_on_model_set: bool = False
+    gateway_pid_file: str = "gateway.pid"
+    gateway_log_file: str = "gateway.log"
+    gateway_state_file: str = "gateway_state.json"
+    gateway_lock_file: str = "gateway.lock"
 
     @property
     def selected_model_path(self) -> Path:
@@ -113,10 +134,27 @@ class StateConfig:
     def benchmark_dir(self) -> Path:
         return self.state_dir / self.benchmark_dir_name
 
+    @property
+    def gateway_pid_path(self) -> Path:
+        return self.state_dir / self.gateway_pid_file
+
+    @property
+    def gateway_log_path(self) -> Path:
+        return self.state_dir / self.gateway_log_file
+
+    @property
+    def gateway_state_path(self) -> Path:
+        return self.state_dir / self.gateway_state_file
+
+    @property
+    def gateway_lock_path(self) -> Path:
+        return self.state_dir / self.gateway_lock_file
+
 
 @dataclass(slots=True)
 class Settings:
     connection: ConnectionConfig
+    gateway: GatewayConfig
     paths: PathsConfig
     runtime_defaults: RuntimeDefaults
     runtimes: dict[str, RuntimeLane]
@@ -126,16 +164,16 @@ class Settings:
     project_config_file: str | None = None
 
     @property
-    def tunnel_socket(self) -> Path:
-        return self.state.state_dir / f"tunnel_{self.connection.host}_{self.connection.local_port}.sock"
+    def backend_tunnel_socket(self) -> Path:
+        return self.state.state_dir / f"tunnel_{self.connection.host}_{self.gateway.backend_local_port}.sock"
 
     @property
-    def tunnel_pid_file(self) -> Path:
-        return self.state.state_dir / f"tunnel_{self.connection.host}_{self.connection.local_port}.pid"
+    def backend_tunnel_pid_file(self) -> Path:
+        return self.state.state_dir / f"tunnel_{self.connection.host}_{self.gateway.backend_local_port}.pid"
 
     @property
-    def tunnel_log_file(self) -> Path:
-        return self.state.state_dir / f"tunnel_{self.connection.host}_{self.connection.local_port}.log"
+    def backend_tunnel_log_file(self) -> Path:
+        return self.state.state_dir / f"tunnel_{self.connection.host}_{self.gateway.backend_local_port}.log"
 
 
 def merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -240,7 +278,7 @@ def load_settings(host: str | None = None, distro: str | None = None, api_key: s
         with local_project_config.open("rb") as handle:
             config = merge_dicts(config, tomllib.load(handle))
 
-    env_overrides: dict[str, Any] = {"connection": {}, "runtime_defaults": {}, "paths": {}}
+    env_overrides: dict[str, Any] = {"connection": {}, "gateway": {}, "runtime_defaults": {}, "paths": {}}
     if os.getenv("WINGPU_HOST"):
         env_overrides["connection"]["host"] = os.environ["WINGPU_HOST"]
     if os.getenv("WINGPU_DISTRO"):
@@ -251,6 +289,22 @@ def load_settings(host: str | None = None, distro: str | None = None, api_key: s
         env_overrides["connection"]["local_port"] = int(os.environ["LOCAL_PORT"])
     if os.getenv("REMOTE_PORT"):
         env_overrides["connection"]["remote_port"] = int(os.environ["REMOTE_PORT"])
+    if os.getenv("WINGPU_GATEWAY_LISTEN_HOST"):
+        env_overrides["gateway"]["listen_host"] = os.environ["WINGPU_GATEWAY_LISTEN_HOST"]
+    if os.getenv("WINGPU_GATEWAY_BACKEND_HOST"):
+        env_overrides["gateway"]["backend_host"] = os.environ["WINGPU_GATEWAY_BACKEND_HOST"]
+    if os.getenv("WINGPU_GATEWAY_BACKEND_LOCAL_PORT"):
+        env_overrides["gateway"]["backend_local_port"] = int(os.environ["WINGPU_GATEWAY_BACKEND_LOCAL_PORT"])
+    if os.getenv("WINGPU_IDLE_OFFLOAD_ENABLED"):
+        env_overrides["gateway"]["idle_offload_enabled"] = os.environ["WINGPU_IDLE_OFFLOAD_ENABLED"].lower() in {"1", "true", "yes", "on"}
+    if os.getenv("WINGPU_IDLE_TIMEOUT_SECONDS"):
+        env_overrides["gateway"]["idle_timeout_seconds"] = int(os.environ["WINGPU_IDLE_TIMEOUT_SECONDS"])
+    if os.getenv("WINGPU_IDLE_POLL_SECONDS"):
+        env_overrides["gateway"]["idle_poll_seconds"] = int(os.environ["WINGPU_IDLE_POLL_SECONDS"])
+    if os.getenv("WINGPU_GATEWAY_REQUEST_TIMEOUT_SECONDS"):
+        env_overrides["gateway"]["request_timeout_seconds"] = int(os.environ["WINGPU_GATEWAY_REQUEST_TIMEOUT_SECONDS"])
+    if os.getenv("WINGPU_RESTART_MODE"):
+        env_overrides["gateway"]["restart_mode"] = os.environ["WINGPU_RESTART_MODE"]
     if os.getenv("SERVED_MODEL_NAME"):
         env_overrides["runtime_defaults"]["served_model_name"] = os.environ["SERVED_MODEL_NAME"]
     if os.getenv("LLAMA_N_GPU_LAYERS"):
@@ -287,6 +341,7 @@ def load_settings(host: str | None = None, distro: str | None = None, api_key: s
     }
     return Settings(
         connection=ConnectionConfig(**config["connection"]),
+        gateway=GatewayConfig(**config["gateway"]),
         paths=PathsConfig(**paths_resolved),
         runtime_defaults=RuntimeDefaults(**config["runtime_defaults"]),
         runtimes=runtimes,
@@ -298,6 +353,10 @@ def load_settings(host: str | None = None, distro: str | None = None, api_key: s
             selected_cache_type_v_file=config["state"]["selected_cache_type_v_file"],
             benchmark_dir_name=config["state"]["benchmark_dir_name"],
             restart_on_model_set=bool(config["state"].get("restart_on_model_set", False)),
+            gateway_pid_file=config["state"].get("gateway_pid_file", "gateway.pid"),
+            gateway_log_file=config["state"].get("gateway_log_file", "gateway.log"),
+            gateway_state_file=config["state"].get("gateway_state_file", "gateway_state.json"),
+            gateway_lock_file=config["state"].get("gateway_lock_file", "gateway.lock"),
         ),
         catalog_file=config_source_label("qwen_gguf_catalog.json"),
         defaults_file=config_source_label("wingpu.defaults.toml"),
@@ -484,7 +543,27 @@ def run_wsl_script(settings: Settings, script: str, *, check: bool = True) -> su
 
 
 def local_api_json(settings: Settings, path: str) -> dict[str, Any]:
-    url = f"http://127.0.0.1:{settings.connection.local_port}{path}"
+    url = f"http://{settings.gateway.listen_host}:{settings.connection.local_port}{path}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {settings.connection.api_key}"})
+    timeout = max(5, settings.gateway.request_timeout_seconds, settings.runtime_defaults.startup_timeout_seconds + 30)
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.load(response)
+
+
+def gateway_admin_json(settings: Settings, path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    url = f"http://{settings.gateway.listen_host}:{settings.connection.local_port}/__wingpu{path}"
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=5) as response:
+        return json.load(response)
+
+
+def backend_api_json(settings: Settings, path: str) -> dict[str, Any]:
+    url = f"http://{settings.gateway.backend_host}:{settings.gateway.backend_local_port}{path}"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {settings.connection.api_key}"})
     with urllib.request.urlopen(req, timeout=5) as response:
         return json.load(response)
@@ -502,22 +581,22 @@ def remote_runtime_log_file(settings: Settings, runtime_id: str) -> str:
     return f"{remote_runtime_base_dir(settings)}/logs/{runtime_id}.log"
 
 
-def ensure_tunnel(settings: Settings) -> None:
+def ensure_backend_tunnel(settings: Settings) -> None:
     print(
-        f"[3/4] Ensuring SSH tunnel localhost:{settings.connection.local_port} -> "
+        f"[3/4] Ensuring backend SSH tunnel localhost:{settings.gateway.backend_local_port} -> "
         f"{settings.connection.host}:127.0.0.1:{settings.connection.remote_port} ..."
     )
     settings.state.state_dir.mkdir(parents=True, exist_ok=True)
-    sock = str(settings.tunnel_socket)
+    sock = str(settings.backend_tunnel_socket)
     check_cmd = ["ssh", "-S", sock, "-O", "check", settings.connection.host]
     if run(check_cmd, check=False).returncode == 0:
-        print("Managed tunnel already running.")
+        print("Managed backend tunnel already running.")
         return
 
-    settings.tunnel_socket.unlink(missing_ok=True)
-    settings.tunnel_pid_file.unlink(missing_ok=True)
-    if local_port_in_use(settings.connection.local_port):
-        raise WingpuError(f"Local port {settings.connection.local_port} is already in use by another process.")
+    settings.backend_tunnel_socket.unlink(missing_ok=True)
+    settings.backend_tunnel_pid_file.unlink(missing_ok=True)
+    if local_port_in_use(settings.gateway.backend_local_port):
+        raise WingpuError(f"Local backend port {settings.gateway.backend_local_port} is already in use by another process.")
 
     start_cmd = [
         "ssh",
@@ -532,26 +611,26 @@ def ensure_tunnel(settings: Settings) -> None:
         "-o",
         f"ServerAliveCountMax={settings.connection.server_alive_count_max}",
         "-E",
-        str(settings.tunnel_log_file),
+        str(settings.backend_tunnel_log_file),
         "-L",
-        f"{settings.connection.local_port}:127.0.0.1:{settings.connection.remote_port}",
+        f"{settings.gateway.backend_local_port}:127.0.0.1:{settings.connection.remote_port}",
         settings.connection.host,
     ]
     run(start_cmd)
     time.sleep(1)
     if run(check_cmd, check=False).returncode != 0:
-        tunnel_log = settings.tunnel_log_file.read_text(encoding="utf-8", errors="ignore")
-        raise WingpuError(f"Failed to establish managed SSH tunnel.\n{tunnel_log}")
-    pid = port_listener_pid(settings.connection.local_port)
+        tunnel_log = settings.backend_tunnel_log_file.read_text(encoding="utf-8", errors="ignore")
+        raise WingpuError(f"Failed to establish managed backend SSH tunnel.\n{tunnel_log}")
+    pid = port_listener_pid(settings.gateway.backend_local_port)
     if pid:
-        settings.tunnel_pid_file.write_text(f"{pid}\n", encoding="utf-8")
+        settings.backend_tunnel_pid_file.write_text(f"{pid}\n", encoding="utf-8")
 
 
-def stop_tunnel(settings: Settings) -> None:
-    print("[1/2] Stopping SSH tunnel...")
-    run(["ssh", "-S", str(settings.tunnel_socket), "-O", "exit", settings.connection.host], check=False)
-    settings.tunnel_socket.unlink(missing_ok=True)
-    settings.tunnel_pid_file.unlink(missing_ok=True)
+def stop_backend_tunnel(settings: Settings) -> None:
+    print("[1/2] Stopping backend SSH tunnel...")
+    run(["ssh", "-S", str(settings.backend_tunnel_socket), "-O", "exit", settings.connection.host], check=False)
+    settings.backend_tunnel_socket.unlink(missing_ok=True)
+    settings.backend_tunnel_pid_file.unlink(missing_ok=True)
 
 
 def stop_remote_runtime(settings: Settings) -> None:
@@ -637,12 +716,36 @@ fi
     run_wsl_script(settings, script)
 
 
-def wait_for_api(settings: Settings, runtime_id: str, model_name: str, cache_type_k: str, cache_type_v: str) -> None:
-    print("[4/4] Waiting for OpenAI-compatible endpoint...")
+def runtime_process_info(settings: Settings, runtime_id: str | None = None) -> dict[str, Any]:
+    runtime_id = runtime_id or selected_runtime(settings)
+    pid_file = remote_runtime_pid_file(settings, runtime_id)
+    log_file = remote_runtime_log_file(settings, runtime_id)
+    script = f"""
+PID_FILE={shlex.quote(pid_file)}
+LOG_FILE={shlex.quote(log_file)}
+if [[ -f "$PID_FILE" ]]; then
+  PID="$(cat "$PID_FILE")"
+  if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+    CMD="$(ps -p "$PID" -o cmd= || true)"
+    printf '{{"running":true,"pid":"%s","log_file":"%s","cmd":%s}}\\n' "$PID" "$LOG_FILE" "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$CMD")"
+    exit 0
+  fi
+fi
+printf '{{"running":false,"pid":null,"log_file":"%s","cmd":""}}\\n' "$LOG_FILE"
+"""
+    result = run_wsl_script(settings, script, check=False)
+    try:
+        return json.loads((result.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        return {"running": False, "pid": None, "log_file": log_file, "cmd": ""}
+
+
+def wait_for_backend_api(settings: Settings, runtime_id: str, model_name: str, cache_type_k: str, cache_type_v: str) -> None:
+    print("[4/4] Waiting for backend OpenAI-compatible endpoint...")
     deadline = time.time() + settings.runtime_defaults.startup_timeout_seconds
     while time.time() < deadline:
         try:
-            local_api_json(settings, "/v1/models")
+            backend_api_json(settings, "/v1/models")
         except Exception:
             time.sleep(2)
             continue
@@ -666,6 +769,53 @@ def wait_for_api(settings: Settings, runtime_id: str, model_name: str, cache_typ
     raise WingpuError(f"llama-server did not become ready in time.\n{detail}")
 
 
+def ensure_runtime_loaded(
+    settings: Settings,
+    model_name: str,
+    runtime_id: str,
+    cache_type_k: str,
+    cache_type_v: str,
+    flash_attn: bool,
+    *,
+    force_restart: bool = False,
+) -> None:
+    check_command("ssh")
+    catalog_entry(settings, model_name)
+    runtime_lane(settings, runtime_id)
+    if not any(cache_type_matches(cache_type_k, supported) for supported in supported_cache_types(settings, runtime_id)):
+        raise WingpuError(f"Unsupported K cache type for {runtime_id}: {cache_type_k}")
+    if not any(cache_type_matches(cache_type_v, supported) for supported in supported_cache_types(settings, runtime_id)):
+        raise WingpuError(f"Unsupported V cache type for {runtime_id}: {cache_type_v}")
+
+    check_ssh_connectivity(settings)
+
+    if force_restart:
+        stop_remote_runtime(settings)
+        stop_backend_tunnel(settings)
+
+    ensure_backend_tunnel(settings)
+    if not force_restart:
+        try:
+            backend_api_json(settings, "/v1/models")
+        except Exception:
+            pass
+        else:
+            set_selected_model(settings, model_name)
+            set_selected_runtime(settings, runtime_id)
+            set_selected_cache_type(settings, "k", cache_type_k, runtime_id)
+            set_selected_cache_type(settings, "v", cache_type_v, runtime_id)
+            return
+
+    process = runtime_process_info(settings, runtime_id)
+    if process.get("running"):
+        stop_remote_runtime(settings)
+        stop_backend_tunnel(settings)
+        ensure_backend_tunnel(settings)
+
+    start_remote_runtime(settings, runtime_id, model_name, cache_type_k, cache_type_v, flash_attn)
+    wait_for_backend_api(settings, runtime_id, model_name, cache_type_k, cache_type_v)
+
+
 def local_port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -677,6 +827,392 @@ def port_listener_pid(port: int) -> str | None:
     return (result.stdout or "").strip().splitlines()[0] if (result.stdout or "").strip() else None
 
 
+def isoformat_ts(timestamp: float | None) -> str | None:
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+
+def read_gateway_state_file(settings: Settings) -> dict[str, Any]:
+    path = settings.state.gateway_state_path
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def gateway_status(settings: Settings) -> dict[str, Any] | None:
+    try:
+        return gateway_admin_json(settings, "/status")
+    except Exception:
+        stale = read_gateway_state_file(settings)
+        if stale:
+            stale["gateway_up"] = False
+        return stale or None
+
+
+def gateway_is_running(settings: Settings) -> bool:
+    status = gateway_status(settings)
+    return bool(status and status.get("gateway_up"))
+
+
+def ensure_gateway_started(settings: Settings) -> None:
+    settings.state.state_dir.mkdir(parents=True, exist_ok=True)
+    status = gateway_status(settings)
+    if status and status.get("gateway_up"):
+        return
+    if local_port_in_use(settings.connection.local_port):
+        raise WingpuError(
+            f"Gateway port {settings.connection.local_port} is already in use by another process."
+        )
+    log_handle = settings.state.gateway_log_path.open("a", encoding="utf-8")
+    env = os.environ.copy()
+    bridge_dir = discover_bridge_dir()
+    if bridge_dir is not None:
+        env["WINGPU_PROJECT_DIR"] = str(bridge_dir)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "wingpu_cli", "__gateway_serve"],
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=env,
+    )
+    settings.state.gateway_pid_path.write_text(f"{proc.pid}\n", encoding="utf-8")
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        status = gateway_status(settings)
+        if status and status.get("gateway_up"):
+            return
+        time.sleep(0.5)
+    log_text = settings.state.gateway_log_path.read_text(encoding="utf-8", errors="ignore")
+    raise WingpuError(f"Gateway did not become ready in time.\n{log_text}")
+
+
+def stop_gateway(settings: Settings) -> None:
+    status = gateway_status(settings)
+    if status and status.get("gateway_up"):
+        try:
+            gateway_admin_json(settings, "/shutdown", method="POST")
+        except Exception:
+            pass
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if not local_port_in_use(settings.connection.local_port):
+                break
+            time.sleep(0.25)
+    if settings.state.gateway_pid_path.exists():
+        try:
+            pid = int(settings.state.gateway_pid_path.read_text(encoding="utf-8").strip())
+        except Exception:
+            pid = 0
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.2)
+        settings.state.gateway_pid_path.unlink(missing_ok=True)
+
+
+def gateway_offload(settings: Settings) -> dict[str, Any]:
+    return gateway_admin_json(settings, "/offload", method="POST")
+
+
+class GatewayCoordinator:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.state_lock = threading.RLock()
+        self.start_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.active_requests = 0
+        self.last_request_started_at: float | None = None
+        self.last_request_finished_at: float | None = None
+        self.last_runtime_start_at: float | None = None
+        self.last_offload_at: float | None = None
+        self.runtime_loaded = runtime_process_info(settings, selected_runtime(settings)).get("running", False)
+        self.idle_status = "runtime_loaded" if self.runtime_loaded else "runtime_offloaded"
+        self.server: ThreadingHTTPServer | None = None
+
+    def write_state(self) -> None:
+        with self.state_lock:
+            backend_tunnel_pid = None
+            if self.settings.backend_tunnel_pid_file.exists():
+                backend_tunnel_pid = self.settings.backend_tunnel_pid_file.read_text(encoding="utf-8").strip() or None
+            state = {
+                "gateway_up": True,
+                "gateway_pid": os.getpid(),
+                "backend_tunnel_pid": backend_tunnel_pid,
+                "active_requests": self.active_requests,
+                "runtime_loaded": self.runtime_loaded,
+                "idle_status": self.idle_status,
+                "idle_offload_enabled": self.settings.gateway.idle_offload_enabled,
+                "idle_timeout_seconds": self.settings.gateway.idle_timeout_seconds,
+                "last_request_started_at": isoformat_ts(self.last_request_started_at),
+                "last_request_finished_at": isoformat_ts(self.last_request_finished_at),
+                "last_runtime_start_at": isoformat_ts(self.last_runtime_start_at),
+                "last_offload_at": isoformat_ts(self.last_offload_at),
+                "selected_model": selected_model(self.settings),
+                "selected_runtime": selected_runtime(self.settings),
+                "selected_cache_type_k": selected_cache_type(self.settings, "k"),
+                "selected_cache_type_v": selected_cache_type(self.settings, "v"),
+            }
+            tmp_path = self.settings.state.gateway_state_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            tmp_path.replace(self.settings.state.gateway_state_path)
+
+    def status_payload(self) -> dict[str, Any]:
+        self.write_state()
+        payload = read_gateway_state_file(self.settings)
+        last_activity = self.last_request_finished_at or self.last_runtime_start_at
+        payload["seconds_until_offload"] = None
+        if self.settings.gateway.idle_offload_enabled and self.runtime_loaded and self.active_requests == 0 and last_activity is not None:
+            payload["seconds_until_offload"] = max(
+                0,
+                int(self.settings.gateway.idle_timeout_seconds - (time.time() - last_activity)),
+            )
+        return payload
+
+    def begin_request(self) -> None:
+        with self.state_lock:
+            self.active_requests += 1
+            self.last_request_started_at = time.time()
+            self.idle_status = "runtime_loading" if not self.runtime_loaded else "runtime_loaded"
+            self.write_state()
+
+    def end_request(self) -> None:
+        with self.state_lock:
+            self.active_requests = max(0, self.active_requests - 1)
+            self.last_request_finished_at = time.time()
+            if self.runtime_loaded:
+                self.idle_status = "runtime_loaded"
+            self.write_state()
+
+    def ensure_runtime_loaded(self) -> None:
+        with self.start_lock:
+            ensure_runtime_loaded(
+                self.settings,
+                selected_model(self.settings),
+                selected_runtime(self.settings),
+                selected_cache_type(self.settings, "k"),
+                selected_cache_type(self.settings, "v"),
+                self.settings.runtime_defaults.flash_attn,
+                force_restart=False,
+            )
+            with self.state_lock:
+                self.runtime_loaded = True
+                self.last_runtime_start_at = time.time()
+                self.idle_status = "runtime_loaded"
+                self.write_state()
+
+    def offload_runtime(self, *, reason: str = "manual") -> dict[str, Any]:
+        with self.start_lock:
+            with self.state_lock:
+                if self.active_requests > 0:
+                    raise WingpuError("Cannot offload while requests are active.")
+            stop_remote_runtime(self.settings)
+            stop_backend_tunnel(self.settings)
+            with self.state_lock:
+                self.runtime_loaded = False
+                self.last_offload_at = time.time()
+                self.idle_status = f"runtime_offloaded:{reason}"
+                self.write_state()
+            return self.status_payload()
+
+    def maybe_idle_offload(self) -> None:
+        if not self.settings.gateway.idle_offload_enabled:
+            return
+        with self.state_lock:
+            if self.active_requests > 0 or not self.runtime_loaded:
+                return
+            last_activity = self.last_request_finished_at or self.last_runtime_start_at
+            if last_activity is None:
+                return
+            if time.time() - last_activity < self.settings.gateway.idle_timeout_seconds:
+                return
+        if self.start_lock.acquire(blocking=False):
+            try:
+                with self.state_lock:
+                    if self.active_requests > 0 or not self.runtime_loaded:
+                        return
+                stop_remote_runtime(self.settings)
+                stop_backend_tunnel(self.settings)
+                with self.state_lock:
+                    self.runtime_loaded = False
+                    self.last_offload_at = time.time()
+                    self.idle_status = "runtime_offloaded:idle"
+                    self.write_state()
+            finally:
+                self.start_lock.release()
+
+    def idle_loop(self) -> None:
+        while not self.stop_event.wait(self.settings.gateway.idle_poll_seconds):
+            try:
+                self.maybe_idle_offload()
+            except Exception:
+                continue
+
+
+class GatewayRequestHandler(BaseHTTPRequestHandler):
+    server_version = "wingpu-gateway/1.0"
+    protocol_version = "HTTP/1.1"
+
+    @property
+    def coordinator(self) -> GatewayCoordinator:
+        return self.server.coordinator  # type: ignore[attr-defined]
+
+    def log_message(self, format: str, *args: Any) -> None:
+        sys.stdout.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), format % args))
+        sys.stdout.flush()
+
+    def _send_json(self, status_code: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def _handle_admin(self) -> bool:
+        if self.path == "/__wingpu/status" and self.command == "GET":
+            self._send_json(200, self.coordinator.status_payload())
+            return True
+        if self.path == "/__wingpu/offload" and self.command == "POST":
+            try:
+                payload = self.coordinator.offload_runtime(reason="manual")
+            except WingpuError as exc:
+                self._send_json(409, {"ok": False, "error": str(exc)})
+            else:
+                self._send_json(200, {"ok": True, "status": payload})
+            return True
+        if self.path == "/__wingpu/shutdown" and self.command == "POST":
+            self._send_json(200, {"ok": True})
+            threading.Thread(target=self.server.shutdown, daemon=True).start()  # type: ignore[attr-defined]
+            self.coordinator.stop_event.set()
+            return True
+        return False
+
+    def _proxy(self) -> None:
+        self.coordinator.begin_request()
+        try:
+            self.coordinator.ensure_runtime_loaded()
+            content_length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(content_length) if content_length else None
+            headers = {
+                key: value
+                for key, value in self.headers.items()
+                if key.lower() not in {
+                    "host",
+                    "connection",
+                    "proxy-connection",
+                    "keep-alive",
+                    "transfer-encoding",
+                    "upgrade",
+                    "proxy-authenticate",
+                    "proxy-authorization",
+                    "te",
+                    "trailer",
+                }
+            }
+            headers["Host"] = f"{self.coordinator.settings.gateway.backend_host}:{self.coordinator.settings.gateway.backend_local_port}"
+            headers["Connection"] = "close"
+            conn = http.client.HTTPConnection(
+                self.coordinator.settings.gateway.backend_host,
+                self.coordinator.settings.gateway.backend_local_port,
+                timeout=self.coordinator.settings.gateway.request_timeout_seconds,
+            )
+            conn.request(self.command, self.path, body=body, headers=headers)
+            resp = conn.getresponse()
+            self.send_response(resp.status, resp.reason)
+            for key, value in resp.getheaders():
+                if key.lower() in {
+                    "connection",
+                    "proxy-connection",
+                    "keep-alive",
+                    "transfer-encoding",
+                    "upgrade",
+                    "proxy-authenticate",
+                    "proxy-authorization",
+                    "te",
+                    "trailer",
+                }:
+                    continue
+                self.send_header(key, value)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            self.close_connection = True
+        except WingpuError as exc:
+            self._send_json(502, {"ok": False, "error": str(exc)})
+        except Exception as exc:
+            self._send_json(502, {"ok": False, "error": f"Gateway proxy error: {exc}"})
+        finally:
+            self.coordinator.end_request()
+
+    def do_GET(self) -> None:
+        if self._handle_admin():
+            return
+        self._proxy()
+
+    def do_POST(self) -> None:
+        if self._handle_admin():
+            return
+        self._proxy()
+
+    def do_DELETE(self) -> None:
+        if self._handle_admin():
+            return
+        self._proxy()
+
+    def do_PUT(self) -> None:
+        if self._handle_admin():
+            return
+        self._proxy()
+
+    def do_PATCH(self) -> None:
+        if self._handle_admin():
+            return
+        self._proxy()
+
+
+def serve_gateway(settings: Settings) -> None:
+    settings.state.state_dir.mkdir(parents=True, exist_ok=True)
+    coordinator = GatewayCoordinator(settings)
+    settings.state.gateway_pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    coordinator.write_state()
+    idle_thread = threading.Thread(target=coordinator.idle_loop, daemon=True)
+    idle_thread.start()
+    server = ThreadingHTTPServer((settings.gateway.listen_host, settings.connection.local_port), GatewayRequestHandler)
+    server.coordinator = coordinator  # type: ignore[attr-defined]
+    coordinator.server = server
+
+    def _handle_signal(signum: int, frame: Any) -> None:
+        coordinator.stop_event.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        coordinator.stop_event.set()
+        settings.state.gateway_pid_path.unlink(missing_ok=True)
+
+
 def print_status(settings: Settings) -> None:
     model_name = selected_model(settings)
     runtime_id = selected_runtime(settings)
@@ -684,6 +1220,7 @@ def print_status(settings: Settings) -> None:
     cache_type_v = selected_cache_type(settings, "v", runtime_id)
     lane = runtime_lane(settings, runtime_id)
     entry = catalog_entry(settings, model_name)
+    gateway_info = gateway_status(settings) or read_gateway_state_file(settings)
     print("== Selected model ==")
     print(f"Name:        {model_name}")
     print(f"Model file:  {entry['gguf_path']}")
@@ -700,51 +1237,55 @@ def print_status(settings: Settings) -> None:
     print(f"Flash attn:  {settings.runtime_defaults.flash_attn}")
     print()
 
-    print("== Local tunnel ==")
-    if run(["ssh", "-S", str(settings.tunnel_socket), "-O", "check", settings.connection.host], check=False).returncode == 0:
-        print(f"Managed tunnel: active ({settings.tunnel_socket})")
+    print("== Gateway ==")
+    if gateway_info and gateway_info.get("gateway_up"):
+        print(f"Gateway:      up on http://{settings.gateway.listen_host}:{settings.connection.local_port}/v1")
+        print(f"Idle status:  {gateway_info.get('idle_status')}")
+        print(f"Active reqs:  {gateway_info.get('active_requests')}")
+        if gateway_info.get("last_request_finished_at"):
+            print(f"Last request: {gateway_info.get('last_request_finished_at')}")
+        if gateway_info.get("last_runtime_start_at"):
+            print(f"Last warm:    {gateway_info.get('last_runtime_start_at')}")
+        if gateway_info.get("seconds_until_offload") is not None:
+            print(f"Offload in:   {gateway_info.get('seconds_until_offload')}s")
+    else:
+        print("Gateway:      down")
+    print(f"PID file:     {settings.state.gateway_pid_path if settings.state.gateway_pid_path.exists() else 'missing'}")
+    print()
+
+    print("== Backend tunnel ==")
+    if run(["ssh", "-S", str(settings.backend_tunnel_socket), "-O", "check", settings.connection.host], check=False).returncode == 0:
+        print(f"Managed tunnel: active ({settings.backend_tunnel_socket})")
     else:
         print("Managed tunnel: inactive")
     pid_note = "missing"
-    if settings.tunnel_pid_file.exists():
-        pid = settings.tunnel_pid_file.read_text(encoding="utf-8").strip()
-        pid_note = f"{settings.tunnel_pid_file} ({'alive PID ' + pid if pid else 'empty'})"
+    if settings.backend_tunnel_pid_file.exists():
+        pid = settings.backend_tunnel_pid_file.read_text(encoding="utf-8").strip()
+        pid_note = f"{settings.backend_tunnel_pid_file} ({'alive PID ' + pid if pid else 'empty'})"
     print(f"PID file: {pid_note}")
-    lsof = run(["lsof", f"-iTCP:{settings.connection.local_port}", "-sTCP:LISTEN", "-nP"], check=False)
+    lsof = run(["lsof", f"-iTCP:{settings.gateway.backend_local_port}", "-sTCP:LISTEN", "-nP"], check=False)
     if (lsof.stdout or "").strip():
         print((lsof.stdout or "").strip())
     print()
 
     print("== Local API check ==")
-    try:
-        local_api_json(settings, "/v1/models")
-        print(f"Reachable: http://127.0.0.1:{settings.connection.local_port}/v1")
-    except Exception as exc:
-        print(f"Unavailable: {exc}")
+    if gateway_info and gateway_info.get("gateway_up"):
+        print(f"Reachable: http://{settings.gateway.listen_host}:{settings.connection.local_port}/v1")
+    else:
+        print("Unavailable: gateway is down")
     print()
 
     print("== Remote runtime process ==")
-    script = f"""
-for RUNTIME_ID in {' '.join(shlex.quote(runtime_id) for runtime_id in settings.runtimes)}; do
-  PID_FILE={shlex.quote(remote_runtime_base_dir(settings))}/run/$RUNTIME_ID.pid
-  LOG_FILE={shlex.quote(remote_runtime_base_dir(settings))}/logs/$RUNTIME_ID.log
-  if [[ -f "$PID_FILE" ]]; then
-    PID="$(cat "$PID_FILE")"
-    if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
-      echo "[$RUNTIME_ID] pid=$PID log=$LOG_FILE"
-      ps -p "$PID" -o pid=,etime=,cmd=
-    else
-      echo "[$RUNTIME_ID] stale pid file: $PID_FILE"
-    fi
-  fi
-done
-"""
-    result = run_wsl_script(settings, script, check=False)
-    output = (result.stdout or "").strip()
-    print(output if output else "No native runtime process is running.")
+    info = runtime_process_info(settings, runtime_id)
+    if info.get("running"):
+        print(f"[{runtime_id}] pid={info.get('pid')} log={info.get('log_file')}")
+        print(info.get("cmd", ""))
+    else:
+        print("No native runtime process is running.")
 
 
 def print_models(settings: Settings) -> None:
+    ensure_gateway_started(settings)
     data = local_api_json(settings, "/v1/models")
     print(json.dumps(data, indent=2))
 
@@ -783,6 +1324,7 @@ def print_config_show(settings: Settings) -> None:
         "project_config_file": settings.project_config_file,
         "catalog_file": str(settings.catalog_file),
         "connection": asdict(settings.connection),
+        "gateway": asdict(settings.gateway),
         "paths": asdict(settings.paths),
         "runtime_defaults": asdict(settings.runtime_defaults),
         "runtimes": {runtime_id: asdict(lane) for runtime_id, lane in settings.runtimes.items()},
@@ -796,6 +1338,10 @@ def print_config_show(settings: Settings) -> None:
             "selected_cache_type_v_path": str(settings.state.selected_cache_type_v_path),
             "benchmark_dir": str(settings.state.benchmark_dir),
             "restart_on_model_set": settings.state.restart_on_model_set,
+            "gateway_pid_path": str(settings.state.gateway_pid_path),
+            "gateway_log_path": str(settings.state.gateway_log_path),
+            "gateway_state_path": str(settings.state.gateway_state_path),
+            "backend_tunnel_pid_path": str(settings.backend_tunnel_pid_file),
         },
         "selected": {
             "model": selected_model(settings),
@@ -821,7 +1367,8 @@ def init_config(force: bool) -> None:
 def maybe_restart_for_model_change(settings: Settings, model_name: str) -> None:
     if not settings.state.restart_on_model_set:
         return
-    stop_tunnel(settings)
+    stop_gateway(settings)
+    stop_backend_tunnel(settings)
     stop_remote_runtime(settings)
     start(settings, model_name)
 
@@ -998,27 +1545,26 @@ def start(
     explicit_cache_type_v: str | None = None,
     flash_attn: bool | None = None,
 ) -> None:
-    check_command("ssh")
     model_name = explicit_model or selected_model(settings)
     runtime_id = explicit_runtime or selected_runtime(settings)
     cache_type_k = explicit_cache_type_k or selected_cache_type(settings, "k", runtime_id)
     cache_type_v = explicit_cache_type_v or selected_cache_type(settings, "v", runtime_id)
     flash_attn = settings.runtime_defaults.flash_attn if flash_attn is None else flash_attn
-    catalog_entry(settings, model_name)
-    runtime_lane(settings, runtime_id)
-    if not any(cache_type_matches(cache_type_k, supported) for supported in supported_cache_types(settings, runtime_id)):
-        raise WingpuError(f"Unsupported K cache type for {runtime_id}: {cache_type_k}")
-    if not any(cache_type_matches(cache_type_v, supported) for supported in supported_cache_types(settings, runtime_id)):
-        raise WingpuError(f"Unsupported V cache type for {runtime_id}: {cache_type_v}")
-    check_ssh_connectivity(settings)
-    stop_remote_runtime(settings)
-    start_remote_runtime(settings, runtime_id, model_name, cache_type_k, cache_type_v, flash_attn)
-    ensure_tunnel(settings)
-    wait_for_api(settings, runtime_id, model_name, cache_type_k, cache_type_v)
+    ensure_gateway_started(settings)
+    ensure_runtime_loaded(
+        settings,
+        model_name,
+        runtime_id,
+        cache_type_k,
+        cache_type_v,
+        flash_attn,
+        force_restart=True,
+    )
 
 
 def stop(settings: Settings) -> None:
-    stop_tunnel(settings)
+    stop_gateway(settings)
+    stop_backend_tunnel(settings)
     stop_remote_runtime(settings)
 
 
@@ -1040,9 +1586,15 @@ def build_parser() -> argparse.ArgumentParser:
     flash_group.add_argument("--no-flash-attn", dest="flash_attn", action="store_false", help="Force flash attention off")
     start_parser.set_defaults(flash_attn=None)
 
-    subparsers.add_parser("stop", help="Stop the SSH tunnel and remote llama.cpp runtime")
-    subparsers.add_parser("status", help="Show selected model, tunnel, and remote runtime status")
+    subparsers.add_parser("stop", help="Stop the gateway, backend tunnel, and remote llama.cpp runtime")
+    subparsers.add_parser("status", help="Show selected model, gateway, tunnel, and remote runtime status")
     subparsers.add_parser("models", help="Show the local OpenAI-compatible model list")
+
+    gateway_parser = subparsers.add_parser("gateway", help="Manage the local always-on gateway")
+    gateway_subparsers = gateway_parser.add_subparsers(dest="gateway_command", required=True)
+    gateway_subparsers.add_parser("start", help="Start the local gateway without warming the remote runtime")
+    gateway_subparsers.add_parser("stop", help="Stop the local gateway without touching the remote runtime")
+    gateway_subparsers.add_parser("status", help="Show gateway status")
 
     model_parser = subparsers.add_parser("model", help="Manage the selected GGUF model")
     model_subparsers = model_parser.add_subparsers(dest="model_command", required=True)
@@ -1104,6 +1656,9 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = config_subparsers.add_parser("init", help="Write the project-local config template")
     init_parser.add_argument("--force", action="store_true", help="Overwrite existing config")
 
+    internal_gateway = subparsers.add_parser("__gateway_serve", help=argparse.SUPPRESS)
+    internal_gateway.set_defaults(internal_gateway=True)
+
     return parser
 
 
@@ -1113,7 +1668,9 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings(host=args.host, distro=args.distro, api_key=args.api_key)
 
     try:
-        if args.command == "start":
+        if args.command == "__gateway_serve":
+            serve_gateway(settings)
+        elif args.command == "start":
             start(
                 settings,
                 explicit_model=args.model_name,
@@ -1128,6 +1685,16 @@ def main(argv: list[str] | None = None) -> int:
             print_status(settings)
         elif args.command == "models":
             print_models(settings)
+        elif args.command == "gateway":
+            if args.gateway_command == "start":
+                ensure_gateway_started(settings)
+                print(f"Gateway listening on http://{settings.gateway.listen_host}:{settings.connection.local_port}/v1")
+            elif args.gateway_command == "stop":
+                stop_gateway(settings)
+                print("Gateway stopped.")
+            elif args.gateway_command == "status":
+                data = gateway_status(settings) or read_gateway_state_file(settings) or {"gateway_up": False}
+                print(json.dumps(data, indent=2))
         elif args.command == "model":
             if args.model_command == "list":
                 print_model_list(settings)

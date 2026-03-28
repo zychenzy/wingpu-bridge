@@ -16,6 +16,16 @@ ssh_connect_timeout = 8
 server_alive_interval = 30
 server_alive_count_max = 3
 
+[gateway]
+listen_host = "127.0.0.1"
+backend_host = "127.0.0.1"
+backend_local_port = 18000
+idle_offload_enabled = true
+idle_timeout_seconds = 1800
+idle_poll_seconds = 5
+request_timeout_seconds = 1800
+restart_mode = "on_demand"
+
 [runtime_defaults]
 default_runtime = "turboquant-cuda"
 served_model_name = "qwen-local"
@@ -66,3 +76,7 @@ selected_cache_type_k_file = "selected_cache_type_k"
 selected_cache_type_v_file = "selected_cache_type_v"
 benchmark_dir_name = "benchmarks"
 restart_on_model_set = false
+gateway_pid_file = "gateway.pid"
+gateway_log_file = "gateway.log"
+gateway_state_file = "gateway_state.json"
+gateway_lock_file = "gateway.lock"

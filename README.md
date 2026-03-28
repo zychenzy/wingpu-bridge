@@ -11,22 +11,24 @@ The published project keeps one stable app contract:
 ## What This Project Covers
 
 - Mac-side control with the `wingpu` CLI
+- A lightweight always-on local gateway on macOS
 - Windows + WSL + NVIDIA runtime management over SSH
 - Native `llama.cpp` and TurboQuant-CUDA runtime lanes
 - GGUF model catalog and model switching without changing app-side config
+- Automatic idle offload of the remote model runtime
 - Local benchmark and experiment workflows for long-context Qwen use
 
 ## System Shape
 
 ```text
-+-----------------------+        SSH control + tunnel        +----------------------+
-| macOS                 | ---------------------------------> | Windows host         |
-| - wingpu              |                                    | - OpenSSH            |
-| - the app            |                                    | - WSL launcher       |
++-----------------------+                                    +----------------------+
+| macOS                 |                                    | Windows host         |
+| - the app            | ---> 127.0.0.1:8000/v1 ---------> | - OpenSSH            |
+| - wingpu gateway      |                                    | - WSL launcher       |
 +-----------+-----------+                                    +----------+-----------+
-            ^                                                           |
             |                                                           |
-            | local API: 127.0.0.1:8000/v1                              v
+            | auto-start / idle-offload                                 |
+            v                                                           v
             |                                                +----------+-----------+
             +----------------------------------------------- | WSL Ubuntu           |
                                                               | - llama-server       |
@@ -66,6 +68,7 @@ wingpu kv set --k turbo3 --v turbo3
 4. Start and verify the local endpoint:
 
 ```bash
+wingpu gateway start
 wingpu start
 wingpu status
 wingpu models
@@ -73,8 +76,7 @@ wingpu models
 
 ## Read This Next
 
-- [Project Guide](/Users/czy/projects/autoresearch/bridge/docs/README.md)
-- [Admin Notes](/Users/czy/projects/autoresearch/bridge/docs/wingpu_admin_notes.md)
+- [Project Guide](docs/README.md)
 
 ## Local-Only Areas
 

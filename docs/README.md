@@ -5,6 +5,7 @@ This guide is the main reference for the published `bridge/` project.
 It describes the current working system:
 
 - `wingpu` runs on macOS
+- a lightweight local gateway stays up on the Mac
 - the actual model server runs inside WSL Ubuntu on a Windows host
 - the runtime uses `llama.cpp`-style servers on an NVIDIA GPU
 - apps on the Mac consume one stable local endpoint: `http://127.0.0.1:8000/v1`
@@ -18,6 +19,7 @@ Stable outer contract:
 - local base URL: `http://127.0.0.1:8000/v1`
 - served model name: `qwen-local`
 - consumer app: `the app`
+- local gateway process stays alive even when the model is offloaded
 
 Experimental inner runtime:
 
@@ -25,6 +27,7 @@ Experimental inner runtime:
 - runtime lane can change
 - KV cache type can change
 - benchmark settings can change
+- the remote model can be automatically unloaded when idle
 
 That design lets us experiment with Qwen, KV compression, and TurboQuant without having to keep reconfiguring the Mac app layer.
 
@@ -33,16 +36,16 @@ That design lets us experiment with Qwen, KV compression, and TurboQuant without
 ### Request path
 
 ```text
-+-------------------+      SSH tunnel      +-------------------+      WSL entry      +-------------------+
-| the app on Mac   | -------------------> | Windows OpenSSH   | ------------------> | WSL Ubuntu        |
++-------------------+      local API       +-------------------+      SSH tunnel     +-------------------+
+| the app on Mac   | -------------------> | wingpu gateway    | ------------------> | Windows OpenSSH   |
 +---------+---------+                      +---------+---------+                     +---------+---------+
           ^                                          |                                         |
-          |                                          |                                         |
           | OpenAI-compatible response               |                                         |
+          |                                          | on demand                               |
           |                                          v                                         v
-          |                                +---------+---------+                     +---------+---------+
-          +------------------------------- | local forwarded   | <------------------ | llama-server       |
-                                           | port 127.0.0.1    |    prompt/decode    | on NVIDIA GPU      |
+          |                                +---------+---------+      WSL entry      +---------+---------+
+          +------------------------------- | backend local port | <------------------ | WSL Ubuntu        |
+                                           | 127.0.0.1:18000    |    prompt/decode    | llama-server       |
                                            +-------------------+                     +-------------------+
 ```
 
@@ -52,7 +55,7 @@ That design lets us experiment with Qwen, KV compression, and TurboQuant without
 +----------------------------- macOS -----------------------------+
 |                                                                |
 |  +-------------------+     +-------------------------------+   |
-|  | wingpu            |     | the app                      |   |
+|  | wingpu CLI        |     | the app                      |   |
 |  | Python + uv       |     | uses local OpenAI endpoint    |   |
 |  +---------+---------+     +---------------+---------------+   |
 |            |                                 |                   |
@@ -60,11 +63,11 @@ That design lets us experiment with Qwen, KV compression, and TurboQuant without
 |            v                                 v                   |
 |  +-------------------+     +-------------------------------+   |
 |  | bridge/config/    |     | 127.0.0.1:8000/v1            |   |
-|  | wingpu.local.toml |     | stable local API contract    |   |
+|  | wingpu.local.toml |     | wingpu gateway               |   |
 |  +-------------------+     +---------------+---------------+   |
 +------------------------------------------------|---------------+
                                                  |
-                                                 | SSH tunnel
+                                                 | backend tunnel
                                                  v
 +--------------------------- Windows ---------------------------+
 |  +-------------------+      +------------------------------+ |
@@ -138,6 +141,8 @@ Typical local fields to set:
 - `connection.host`
 - `connection.distro`
 - `connection.api_key`
+- `gateway.backend_local_port`
+- `gateway.idle_timeout_seconds`
 - `paths.remote_home`
 - `paths.remote_src_root`
 - `paths.remote_models_root`
@@ -210,6 +215,7 @@ wingpu kv set --k turbo3 --v turbo3
 ### Start and verify
 
 ```bash
+wingpu gateway start
 wingpu start
 wingpu status
 wingpu models
@@ -218,6 +224,7 @@ wingpu models
 Expected outcome:
 
 - local API reachable on `127.0.0.1:8000`
+- gateway remains available even if the remote model is later offloaded
 - served model remains `qwen-local`
 - `the app` does not need reconfiguration when you switch model or runtime lane
 
@@ -236,6 +243,7 @@ wingpu benchmark run
 - model id: `qwen-local`
 
 The important design rule is that `the app` never needs to know the actual GGUF filename or the runtime lane.
+The local gateway absorbs cold-start and idle-offload behavior.
 
 ## 8. Runtime Lanes
 
@@ -274,7 +282,8 @@ This keeps the repo publishable while still leaving room for local notes, mirror
 
 ## 10. Troubleshooting Checklist
 
-- `wingpu status` should show both a healthy SSH tunnel and a live remote runtime
+- `wingpu status` should show a healthy local gateway and, when warm, a backend tunnel and live remote runtime
+- `wingpu gateway status` should tell you whether the model is loaded or offloaded
 - `wingpu models` should return `qwen-local`
 - if a build fails, rerun the relevant `wingpu admin ...` prerequisite command
 - if the runtime starts but generation fails, compare the selected KV cache types against the active runtime lane's supported cache types
