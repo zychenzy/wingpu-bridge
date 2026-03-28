@@ -1,0 +1,16 @@
+{
+  "project": "example-project",
+  "containerized": true,
+  "image": "nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04",
+  "cmd": "nvidia-smi",
+  "gpu": "all",
+  "workdir": "$HOME/work/example-project",
+  "mount_path": "/workspace",
+  "env_file": "$HOME/work/example-project/.env",
+  "resources": {
+    "cpus": "8",
+    "memory": "32g",
+    "shm_size": "8g"
+  },
+  "max_retries": 0
+}

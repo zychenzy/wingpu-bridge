@@ -1,0 +1,23 @@
+[project]
+name = "wingpu"
+version = "0.1.0"
+description = "Mac controller for a Windows + WSL GPU bridge"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+wingpu = "wingpu_cli.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wingpu_cli"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"../config/wingpu.defaults.toml" = "src/wingpu_cli/resources/wingpu.defaults.toml"
+"../config/qwen_gguf_catalog.json" = "src/wingpu_cli/resources/qwen_gguf_catalog.json"
+
+[tool.uv]
+package = true

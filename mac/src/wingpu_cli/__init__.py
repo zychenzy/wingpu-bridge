@@ -1,0 +1,1 @@
+"""wingpu CLI package."""

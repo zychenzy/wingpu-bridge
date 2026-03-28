@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+mac/.venv/
+mac/src/wingpu_cli/__pycache__/
+config/wingpu.local.toml
+profiles/*.json
+!profiles/template.json
+reports/*
+!reports/.gitkeep
+remote-only/wsl-llama/
