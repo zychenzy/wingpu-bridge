@@ -27,6 +27,29 @@ flowchart LR
   WSL --> OpenAI
 ```
 
+Plain-text version:
+
+```text
++-----------------------+        SSH control + tunnel        +----------------------+
+| macOS                 | ---------------------------------> | Windows host         |
+| - wingpu              |                                    | - OpenSSH            |
+| - the app            |                                    | - WSL launcher       |
++-----------+-----------+                                    +----------+-----------+
+            ^                                                           |
+            |                                                           |
+            | local API: 127.0.0.1:8000/v1                              v
+            |                                                +----------+-----------+
+            +----------------------------------------------- | WSL Ubuntu           |
+                                                              | - llama-server       |
+                                                              | - runtime lane       |
+                                                              +----------+-----------+
+                                                                         |
+                                                                         v
+                                                              +----------+-----------+
+                                                              | NVIDIA GPU           |
+                                                              +----------------------+
+```
+
 ## Quick Start
 
 1. Install the CLI:
