@@ -376,6 +376,20 @@ def load_catalog(settings: Settings) -> dict[str, Any]:
     return catalog
 
 
+def writable_catalog_path() -> Path:
+    candidate = config_file_path("qwen_gguf_catalog.json")
+    if candidate is None:
+        raise WingpuError(
+            "Cannot modify the model catalog because no project-local qwen_gguf_catalog.json was found."
+        )
+    return candidate
+
+
+def save_catalog(catalog: dict[str, Any]) -> None:
+    target = writable_catalog_path()
+    target.write_text(json.dumps(catalog, indent=2) + "\n", encoding="utf-8")
+
+
 def catalog_default_model(settings: Settings) -> str:
     return load_catalog(settings)["default_model"]
 
@@ -422,6 +436,27 @@ def set_selected_model(settings: Settings, model_name: str) -> None:
     catalog_entry(settings, model_name)
     settings.state.state_dir.mkdir(parents=True, exist_ok=True)
     settings.state.selected_model_path.write_text(f"{model_name}\n", encoding="utf-8")
+
+
+def set_catalog_default_model(settings: Settings, model_name: str) -> None:
+    catalog_entry(settings, model_name)
+    catalog = load_catalog(settings)
+    catalog["default_model"] = model_name
+    save_catalog(catalog)
+
+
+def set_catalog_context_length(settings: Settings, model_name: str, context_length: int) -> None:
+    if context_length <= 0:
+        raise WingpuError("Context length must be a positive integer")
+    catalog_entry(settings, model_name)
+    catalog = load_catalog(settings)
+    catalog["models"][model_name]["context_length"] = int(context_length)
+    save_catalog(catalog)
+
+
+def catalog_context_length(settings: Settings, model_name: str) -> int:
+    entry = catalog_entry(settings, model_name)
+    return int(entry["context_length"])
 
 
 def selected_runtime(settings: Settings) -> str:
@@ -769,6 +804,17 @@ def wait_for_backend_api(settings: Settings, runtime_id: str, model_name: str, c
     raise WingpuError(f"llama-server did not become ready in time.\n{detail}")
 
 
+def backend_ready_for_fast_path(settings: Settings, runtime_id: str) -> bool:
+    process = runtime_process_info(settings, runtime_id)
+    if not process.get("running"):
+        return False
+    try:
+        backend_api_json(settings, "/v1/models")
+    except Exception:
+        return False
+    return True
+
+
 def ensure_runtime_loaded(
     settings: Settings,
     model_name: str,
@@ -794,17 +840,12 @@ def ensure_runtime_loaded(
         stop_backend_tunnel(settings)
 
     ensure_backend_tunnel(settings)
-    if not force_restart:
-        try:
-            backend_api_json(settings, "/v1/models")
-        except Exception:
-            pass
-        else:
-            set_selected_model(settings, model_name)
-            set_selected_runtime(settings, runtime_id)
-            set_selected_cache_type(settings, "k", cache_type_k, runtime_id)
-            set_selected_cache_type(settings, "v", cache_type_v, runtime_id)
-            return
+    if not force_restart and backend_ready_for_fast_path(settings, runtime_id):
+        set_selected_model(settings, model_name)
+        set_selected_runtime(settings, runtime_id)
+        set_selected_cache_type(settings, "k", cache_type_k, runtime_id)
+        set_selected_cache_type(settings, "v", cache_type_v, runtime_id)
+        return
 
     process = runtime_process_info(settings, runtime_id)
     if process.get("running"):
@@ -1012,6 +1053,27 @@ class GatewayCoordinator:
                 self.idle_status = "runtime_loaded"
                 self.write_state()
 
+    def recover_runtime_after_proxy_error(self, exc: Exception) -> None:
+        with self.start_lock:
+            with self.state_lock:
+                self.runtime_loaded = False
+                self.idle_status = f"runtime_recovering:{type(exc).__name__}"
+                self.write_state()
+            ensure_runtime_loaded(
+                self.settings,
+                selected_model(self.settings),
+                selected_runtime(self.settings),
+                selected_cache_type(self.settings, "k"),
+                selected_cache_type(self.settings, "v"),
+                self.settings.runtime_defaults.flash_attn,
+                force_restart=True,
+            )
+            with self.state_lock:
+                self.runtime_loaded = True
+                self.last_runtime_start_at = time.time()
+                self.idle_status = "runtime_loaded"
+                self.write_state()
+
     def offload_runtime(self, *, reason: str = "manual") -> dict[str, Any]:
         with self.start_lock:
             with self.state_lock:
@@ -1101,61 +1163,87 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             return True
         return False
 
+    @staticmethod
+    def _is_retryable_proxy_error(exc: Exception) -> bool:
+        if isinstance(
+            exc,
+            (
+                http.client.RemoteDisconnected,
+                ConnectionResetError,
+                ConnectionAbortedError,
+                BrokenPipeError,
+                TimeoutError,
+                socket.timeout,
+            ),
+        ):
+            return True
+        message = str(exc).lower()
+        return "remote end closed connection without response" in message or "connection reset" in message
+
+    def _proxy_once(self) -> None:
+        self.coordinator.ensure_runtime_loaded()
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(content_length) if content_length else None
+        headers = {
+            key: value
+            for key, value in self.headers.items()
+            if key.lower() not in {
+                "host",
+                "connection",
+                "proxy-connection",
+                "keep-alive",
+                "transfer-encoding",
+                "upgrade",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "te",
+                "trailer",
+            }
+        }
+        headers["Host"] = f"{self.coordinator.settings.gateway.backend_host}:{self.coordinator.settings.gateway.backend_local_port}"
+        headers["Connection"] = "close"
+        conn = http.client.HTTPConnection(
+            self.coordinator.settings.gateway.backend_host,
+            self.coordinator.settings.gateway.backend_local_port,
+            timeout=self.coordinator.settings.gateway.request_timeout_seconds,
+        )
+        conn.request(self.command, self.path, body=body, headers=headers)
+        resp = conn.getresponse()
+        self.send_response(resp.status, resp.reason)
+        for key, value in resp.getheaders():
+            if key.lower() in {
+                "connection",
+                "proxy-connection",
+                "keep-alive",
+                "transfer-encoding",
+                "upgrade",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "te",
+                "trailer",
+            }:
+                continue
+            self.send_header(key, value)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        while True:
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            self.wfile.write(chunk)
+            self.wfile.flush()
+        self.close_connection = True
+
     def _proxy(self) -> None:
         self.coordinator.begin_request()
         try:
-            self.coordinator.ensure_runtime_loaded()
-            content_length = int(self.headers.get("Content-Length", "0") or "0")
-            body = self.rfile.read(content_length) if content_length else None
-            headers = {
-                key: value
-                for key, value in self.headers.items()
-                if key.lower() not in {
-                    "host",
-                    "connection",
-                    "proxy-connection",
-                    "keep-alive",
-                    "transfer-encoding",
-                    "upgrade",
-                    "proxy-authenticate",
-                    "proxy-authorization",
-                    "te",
-                    "trailer",
-                }
-            }
-            headers["Host"] = f"{self.coordinator.settings.gateway.backend_host}:{self.coordinator.settings.gateway.backend_local_port}"
-            headers["Connection"] = "close"
-            conn = http.client.HTTPConnection(
-                self.coordinator.settings.gateway.backend_host,
-                self.coordinator.settings.gateway.backend_local_port,
-                timeout=self.coordinator.settings.gateway.request_timeout_seconds,
-            )
-            conn.request(self.command, self.path, body=body, headers=headers)
-            resp = conn.getresponse()
-            self.send_response(resp.status, resp.reason)
-            for key, value in resp.getheaders():
-                if key.lower() in {
-                    "connection",
-                    "proxy-connection",
-                    "keep-alive",
-                    "transfer-encoding",
-                    "upgrade",
-                    "proxy-authenticate",
-                    "proxy-authorization",
-                    "te",
-                    "trailer",
-                }:
-                    continue
-                self.send_header(key, value)
-            self.send_header("Connection", "close")
-            self.end_headers()
-            while True:
-                chunk = resp.read(64 * 1024)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-            self.close_connection = True
+            try:
+                self._proxy_once()
+            except Exception as exc:
+                if not self._is_retryable_proxy_error(exc):
+                    raise
+                self.coordinator.recover_runtime_after_proxy_error(exc)
+                self._proxy_once()
         except WingpuError as exc:
             self._send_json(502, {"ok": False, "error": str(exc)})
         except Exception as exc:
@@ -1295,7 +1383,7 @@ def print_model_list(settings: Settings) -> None:
     default = catalog["default_model"]
     for name, entry in catalog["models"].items():
         print(
-            f"{name}\tdefault={name == default}\tenabled={entry['enabled']}\t"
+            f"{name}\tdefault={name == default}\tenabled={entry['enabled']}\tcontext_length={entry['context_length']}\t"
             f"path={entry['gguf_path']}\tnotes={entry['notes']}"
         )
 
@@ -1568,6 +1656,25 @@ def stop(settings: Settings) -> None:
     stop_remote_runtime(settings)
 
 
+def restart(
+    settings: Settings,
+    explicit_model: str | None = None,
+    explicit_runtime: str | None = None,
+    explicit_cache_type_k: str | None = None,
+    explicit_cache_type_v: str | None = None,
+    flash_attn: bool | None = None,
+) -> None:
+    stop(settings)
+    start(
+        settings,
+        explicit_model=explicit_model,
+        explicit_runtime=explicit_runtime,
+        explicit_cache_type_k=explicit_cache_type_k,
+        explicit_cache_type_v=explicit_cache_type_v,
+        flash_attn=flash_attn,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wingpu", description="Mac helper for the Windows + WSL GPU bridge")
     parser.add_argument("--host", help="Override configured Windows SSH host")
@@ -1586,6 +1693,16 @@ def build_parser() -> argparse.ArgumentParser:
     flash_group.add_argument("--no-flash-attn", dest="flash_attn", action="store_false", help="Force flash attention off")
     start_parser.set_defaults(flash_attn=None)
 
+    restart_parser = subparsers.add_parser("restart", help="Restart the gateway, backend tunnel, and remote llama.cpp runtime")
+    restart_parser.add_argument("model_name", nargs="?", help="Optional one-shot model override")
+    restart_parser.add_argument("--runtime", dest="runtime_id", help="Runtime lane override")
+    restart_parser.add_argument("--cache-type-k", help="Override selected K cache type")
+    restart_parser.add_argument("--cache-type-v", help="Override selected V cache type")
+    restart_flash_group = restart_parser.add_mutually_exclusive_group()
+    restart_flash_group.add_argument("--flash-attn", dest="flash_attn", action="store_true", help="Force flash attention on")
+    restart_flash_group.add_argument("--no-flash-attn", dest="flash_attn", action="store_false", help="Force flash attention off")
+    restart_parser.set_defaults(flash_attn=None)
+
     subparsers.add_parser("stop", help="Stop the gateway, backend tunnel, and remote llama.cpp runtime")
     subparsers.add_parser("status", help="Show selected model, gateway, tunnel, and remote runtime status")
     subparsers.add_parser("models", help="Show the local OpenAI-compatible model list")
@@ -1602,6 +1719,11 @@ def build_parser() -> argparse.ArgumentParser:
     model_subparsers.add_parser("current", help="Show the persisted selected model")
     set_parser = model_subparsers.add_parser("set", help="Persist the selected model without starting/stopping")
     set_parser.add_argument("model_name")
+    default_parser = model_subparsers.add_parser("default", help="Set the catalog default model")
+    default_parser.add_argument("model_name")
+    context_parser = model_subparsers.add_parser("context", help="Show or set the catalog context length for a model")
+    context_parser.add_argument("model_name")
+    context_parser.add_argument("context_length", nargs="?", type=int)
 
     runtime_parser = subparsers.add_parser("runtime", help="Manage the runtime lane")
     runtime_subparsers = runtime_parser.add_subparsers(dest="runtime_command", required=True)
@@ -1679,6 +1801,15 @@ def main(argv: list[str] | None = None) -> int:
                 explicit_cache_type_v=args.cache_type_v,
                 flash_attn=args.flash_attn,
             )
+        elif args.command == "restart":
+            restart(
+                settings,
+                explicit_model=args.model_name,
+                explicit_runtime=args.runtime_id,
+                explicit_cache_type_k=args.cache_type_k,
+                explicit_cache_type_v=args.cache_type_v,
+                flash_attn=args.flash_attn,
+            )
         elif args.command == "stop":
             stop(settings)
         elif args.command == "status":
@@ -1704,6 +1835,15 @@ def main(argv: list[str] | None = None) -> int:
                 set_selected_model(settings, args.model_name)
                 print(f"Selected model set to: {args.model_name}")
                 maybe_restart_for_model_change(settings, args.model_name)
+            elif args.model_command == "default":
+                set_catalog_default_model(settings, args.model_name)
+                print(f"Catalog default model set to: {args.model_name}")
+            elif args.model_command == "context":
+                if args.context_length is None:
+                    print(catalog_context_length(settings, args.model_name))
+                else:
+                    set_catalog_context_length(settings, args.model_name, args.context_length)
+                    print(f"Catalog context length set: {args.model_name} -> {args.context_length}")
         elif args.command == "runtime":
             if args.runtime_command == "list":
                 print_runtime_list(settings)
