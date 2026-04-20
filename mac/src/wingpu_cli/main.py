@@ -15,6 +15,7 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from importlib import resources as importlib_resources
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -274,9 +275,13 @@ def project_config_path() -> Path | None:
 def load_settings(host: str | None = None, distro: str | None = None, api_key: str | None = None) -> Settings:
     config = tomllib.loads(read_config_bytes("wingpu.defaults.toml").decode("utf-8"))
     local_project_config = project_config_path()
-    if local_project_config is not None and local_project_config.exists():
-        with local_project_config.open("rb") as handle:
-            config = merge_dicts(config, tomllib.load(handle))
+    if local_project_config is None or not local_project_config.exists():
+        raise WingpuError(
+            "Missing project-local wingpu.local.toml. Run wingpu from the bridge project, set WINGPU_PROJECT_DIR, "
+            "or create bridge/config/wingpu.local.toml."
+        )
+    with local_project_config.open("rb") as handle:
+        config = merge_dicts(config, tomllib.load(handle))
 
     env_overrides: dict[str, Any] = {"connection": {}, "gateway": {}, "runtime_defaults": {}, "paths": {}}
     if os.getenv("WINGPU_HOST"):
@@ -604,8 +609,16 @@ def backend_api_json(settings: Settings, path: str) -> dict[str, Any]:
         return json.load(response)
 
 
+def resolve_remote_path(settings: Settings, path: str) -> str:
+    if path == "~":
+        return settings.paths.remote_home
+    if path.startswith("~/"):
+        return posixpath.join(settings.paths.remote_home, path[2:])
+    return path
+
+
 def remote_runtime_base_dir(settings: Settings) -> str:
-    return settings.runtime_defaults.remote_state_dir
+    return resolve_remote_path(settings, settings.runtime_defaults.remote_state_dir)
 
 
 def remote_runtime_pid_file(settings: Settings, runtime_id: str) -> str:
@@ -1144,7 +1157,68 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.close_connection = True
 
+    def _local_models_payload(self) -> dict[str, Any]:
+        model_name = selected_model(self.coordinator.settings)
+        entry = catalog_entry(self.coordinator.settings, model_name)
+        created = int(time.time())
+        return {
+            "object": "list",
+            "data": [{
+                "id": self.coordinator.settings.runtime_defaults.served_model_name,
+                "aliases": [self.coordinator.settings.runtime_defaults.served_model_name],
+                "tags": [],
+                "object": "model",
+                "created": created,
+                "owned_by": "llamacpp",
+                "meta": {
+                    "n_ctx_train": int(entry.get("context_length", 0) or 0),
+                    "size": int(entry.get("size_bytes", 0) or 0),
+                },
+            }],
+            "models": [{
+                "name": self.coordinator.settings.runtime_defaults.served_model_name,
+                "model": self.coordinator.settings.runtime_defaults.served_model_name,
+                "modified_at": "",
+                "size": str(entry.get("size_bytes", "") or ""),
+                "digest": "",
+                "type": "model",
+                "description": "local metadata shim",
+                "tags": [""],
+                "capabilities": ["completion"],
+                "parameters": "",
+                "details": {
+                    "parent_model": "",
+                    "format": "gguf",
+                    "family": "",
+                    "families": [""],
+                    "parameter_size": "",
+                    "quantization_level": "",
+                },
+            }],
+        }
+
+    def _local_props_payload(self) -> dict[str, Any]:
+        model_name = selected_model(self.coordinator.settings)
+        entry = catalog_entry(self.coordinator.settings, model_name)
+        return {
+            "model_path": remote_model_path(self.coordinator.settings, model_name),
+            "model_alias": self.coordinator.settings.runtime_defaults.served_model_name,
+            "default_generation_settings": {
+                "n_ctx": int(entry.get("context_length", 0) or 0),
+            },
+        }
+
     def _handle_admin(self) -> bool:
+        path_only = urlsplit(self.path).path
+        if self.command == "GET" and path_only in {"/v1/models", "/models", "/api/v1/models"}:
+            self._send_json(200, self._local_models_payload())
+            return True
+        if self.command == "GET" and path_only in {"/v1/props", "/props"}:
+            self._send_json(200, self._local_props_payload())
+            return True
+        if self.command == "GET" and path_only in {"/version", "/api/tags"}:
+            self._send_json(404, {"error": {"message": "Not found", "type": "not_found_error", "code": 404}})
+            return True
         if self.path == "/__wingpu/status" and self.command == "GET":
             self._send_json(200, self.coordinator.status_payload())
             return True
