@@ -1,48 +1,18 @@
 {
   "model_root": "{remote_models_root}",
-  "default_model": "Qwen3.5-27B-Q3_K_M",
+  "default_model": "Qwen3.6-35B-A3B-UD-IQ3_S",
   "models": {
-    "Qwen3.5-27B-Q3_K_M": {
-      "gguf_relpath": "Qwen3.5-27B-GGUF/Qwen3.5-27B-Q3_K_M.gguf",
-      "context_length": 8192,
+    "Qwen3.6-35B-A3B-UD-IQ3_S": {
+      "gguf_relpath": "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+      "context_length": 131072,
       "enabled": true,
-      "notes": "Recommended 27B baseline for a 16 GB GPU."
+      "notes": "35B A3B UD IQ3_S variant for good balance with high quality and speed within the new Qwen3.6 GGUF set."
     },
-    "Qwen3.5-27B-Q3_K_S": {
-      "gguf_relpath": "Qwen3.5-27B-GGUF/Qwen3.5-27B-Q3_K_S.gguf",
-      "context_length": 8192,
+    "Qwen3.6-35B-A3B-UD-Q3_K_S": {
+      "gguf_relpath": "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_S.gguf",
+      "context_length": 131072,
       "enabled": true,
-      "notes": "Smaller 27B variant for extra VRAM headroom."
-    },
-    "Qwen3.5-27B-UD-Q3_K_XL": {
-      "gguf_relpath": "Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q3_K_XL.gguf",
-      "context_length": 8192,
-      "enabled": true,
-      "notes": "Useful 27B experiment target for TurboQuant-style testing."
-    },
-    "Qwen3.5-9B-IQ4_NL": {
-      "gguf_relpath": "Qwen3.5-9B-GGUF/Qwen3.5-9B-IQ4_NL.gguf",
-      "context_length": 8192,
-      "enabled": true,
-      "notes": "Most aggressive VRAM-saving variant."
-    },
-    "Qwen3.5-9B-Q4_K_M": {
-      "gguf_relpath": "Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf",
-      "context_length": 8192,
-      "enabled": true,
-      "notes": "Recommended default balance of quality and speed."
-    },
-    "Qwen3.5-9B-Q5_K_M": {
-      "gguf_relpath": "Qwen3.5-9B-GGUF/Qwen3.5-9B-Q5_K_M.gguf",
-      "context_length": 8192,
-      "enabled": true,
-      "notes": "Higher quality with more VRAM usage."
-    },
-    "Qwen3.5-9B-Q6_K": {
-      "gguf_relpath": "Qwen3.5-9B-GGUF/Qwen3.5-9B-Q6_K.gguf",
-      "context_length": 8192,
-      "enabled": true,
-      "notes": "Highest quality of the downloaded GGUF set."
+      "notes": "35B A3B UD Q3_K_S variant for good balance with high quality and speed within the new Qwen3.6 GGUF set."
     }
   }
 }
