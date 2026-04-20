@@ -1,5 +1,6 @@
 import http.client
 import io
+import json
 import unittest
 from unittest import mock
 
@@ -229,6 +230,33 @@ gateway_lock_file = "gateway.lock"
         self.assertEqual(remote_runtime_base_dir(settings), "/home/czy/.gpu-bridge")
         self.assertEqual(remote_runtime_pid_file(settings, "turboquant-cuda"), "/home/czy/.gpu-bridge/run/turboquant-cuda.pid")
         self.assertEqual(remote_runtime_log_file(settings, "turboquant-cuda"), "/home/czy/.gpu-bridge/logs/turboquant-cuda.log")
+
+    def test_save_catalog_preserves_config_driven_model_root_and_strips_derived_paths(self):
+        catalog = {
+            "model_root": "/home/czy/models/Qwen",
+            "default_model": "Qwen3.6-35B-A3B-UD-IQ3_S",
+            "models": {
+                "Qwen3.6-35B-A3B-UD-IQ3_S": {
+                    "gguf_relpath": "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+                    "gguf_path": "/home/czy/models/Qwen/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+                    "context_length": 131072,
+                    "enabled": True,
+                }
+            },
+        }
+        target = io_path() / "qwen_gguf_catalog.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        with mock.patch.object(main, "writable_catalog_path", return_value=target):
+            main.save_catalog(catalog, make_settings())
+
+        saved = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(saved["model_root"], "{remote_models_root}")
+        self.assertNotIn("gguf_path", saved["models"]["Qwen3.6-35B-A3B-UD-IQ3_S"])
+        self.assertEqual(
+            saved["models"]["Qwen3.6-35B-A3B-UD-IQ3_S"]["gguf_relpath"],
+            "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+        )
 
     def test_main_restart_calls_stop_then_start(self):
         settings = make_settings()

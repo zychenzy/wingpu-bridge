@@ -61,7 +61,7 @@ $EDITOR bridge/config/wingpu.local.toml
 ```bash
 wingpu build upstream
 wingpu runtime set turboquant-cuda
-wingpu model set Qwen3.5-27B-Q3_K_M
+wingpu model set Qwen3.6-35B-A3B-UD-IQ3_S
 wingpu kv set --k turbo3 --v turbo3
 ```
 
@@ -72,6 +72,35 @@ wingpu gateway start
 wingpu start
 wingpu status
 wingpu models
+```
+
+## Model Selection Rules
+
+`wingpu` keeps two separate ideas:
+
+- `bridge/config/qwen_gguf_catalog.json` defines the catalog and its `default_model`
+- `wingpu model set ...` writes the persisted selected model used for normal starts
+
+In practice:
+
+- adding or editing catalog entries is picked up on the next `wingpu` command
+- changing `default_model` only matters when no selected model is already pinned
+- `wingpu start` uses the selected model first, then falls back to `default_model`
+
+If you changed the catalog manually and want the new model active right away:
+
+```bash
+wingpu model set YOUR_MODEL_NAME
+wingpu stop
+wingpu start
+wingpu status
+```
+
+Useful checks:
+
+```bash
+wingpu model list
+wingpu model current
 ```
 
 ## Read This Next

@@ -390,9 +390,27 @@ def writable_catalog_path() -> Path:
     return candidate
 
 
-def save_catalog(catalog: dict[str, Any]) -> None:
+def save_catalog(catalog: dict[str, Any], settings: Settings | None = None) -> None:
+    normalized = json.loads(json.dumps(catalog))
+    if settings is not None:
+        if normalized.get("model_root") == settings.paths.remote_models_root:
+            normalized["model_root"] = "{remote_models_root}"
+        model_root = normalized.get("model_root")
+        for entry in normalized.get("models", {}).values():
+            if not isinstance(entry, dict):
+                continue
+            gguf_relpath = entry.get("gguf_relpath")
+            gguf_path = entry.get("gguf_path")
+            if gguf_relpath and gguf_path:
+                expected_paths = {
+                    posixpath.join(settings.paths.remote_models_root, gguf_relpath),
+                }
+                if model_root:
+                    expected_paths.add(posixpath.join(str(model_root), gguf_relpath))
+                if gguf_path in expected_paths:
+                    entry.pop("gguf_path", None)
     target = writable_catalog_path()
-    target.write_text(json.dumps(catalog, indent=2) + "\n", encoding="utf-8")
+    target.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
 
 
 def catalog_default_model(settings: Settings) -> str:
@@ -447,7 +465,7 @@ def set_catalog_default_model(settings: Settings, model_name: str) -> None:
     catalog_entry(settings, model_name)
     catalog = load_catalog(settings)
     catalog["default_model"] = model_name
-    save_catalog(catalog)
+    save_catalog(catalog, settings)
 
 
 def set_catalog_context_length(settings: Settings, model_name: str, context_length: int) -> None:
@@ -456,7 +474,7 @@ def set_catalog_context_length(settings: Settings, model_name: str, context_leng
     catalog_entry(settings, model_name)
     catalog = load_catalog(settings)
     catalog["models"][model_name]["context_length"] = int(context_length)
-    save_catalog(catalog)
+    save_catalog(catalog, settings)
 
 
 def catalog_context_length(settings: Settings, model_name: str) -> int:

@@ -192,6 +192,37 @@ wingpu config init
 $EDITOR bridge/config/wingpu.local.toml
 ```
 
+### Model catalog vs selected model
+
+This is the main behavior that tends to surprise people:
+
+- `bridge/config/qwen_gguf_catalog.json` is the catalog of known models
+- `default_model` inside that catalog is only the fallback
+- `wingpu model set ...` persists the selected model and takes precedence over the catalog default
+
+That means:
+
+- if you add a new model entry manually, it should appear on the next `wingpu model list`
+- if you change `default_model`, that does not override an already-selected model
+- if a runtime is already warm, restart it to actually serve the newly selected model
+
+Useful commands:
+
+```bash
+wingpu model list
+wingpu model current
+wingpu status
+```
+
+To make a manual catalog change take effect immediately:
+
+```bash
+wingpu model set YOUR_MODEL_NAME
+wingpu stop
+wingpu start
+wingpu status
+```
+
 ## 6. Daily Workflow
 
 ### Build runtime lanes
@@ -205,7 +236,8 @@ wingpu build turboquant-cuda
 
 ```bash
 wingpu model list
-wingpu model set Qwen3.5-27B-Q3_K_M
+wingpu model current
+wingpu model set Qwen3.6-35B-A3B-UD-IQ3_S
 wingpu runtime list
 wingpu runtime set turboquant-cuda
 wingpu kv show
@@ -227,6 +259,7 @@ Expected outcome:
 - gateway remains available even if the remote model is later offloaded
 - served model remains `qwen-local`
 - `OpenClaw` does not need reconfiguration when you switch model or runtime lane
+- `wingpu status` shows the selected GGUF entry, not just the stable served model id
 
 ### Benchmark
 
