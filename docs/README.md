@@ -62,7 +62,7 @@ That design lets us experiment with Qwen, KV compression, and TurboQuant without
 |            | reads                           | calls             |
 |            v                                 v                   |
 |  +-------------------+     +-------------------------------+   |
-|  | bridge/config/    |     | 127.0.0.1:8000/v1            |   |
+|  | ~/.config/wingpu/ |     | 127.0.0.1:8000/v1            |   |
 |  | wingpu.local.toml |     | wingpu gateway               |   |
 |  +-------------------+     +---------------+---------------+   |
 +------------------------------------------------|---------------+
@@ -126,15 +126,18 @@ These are not the primary daily control path anymore, but they remain useful as 
 
 ## 4. Configuration Model
 
-The controller now treats the project directory as the source of truth.
+The controller starts from committed defaults, then applies one machine-specific local config.
 
 Config sources:
 
-1. committed defaults from `bridge/config/wingpu.defaults.toml`
-2. local override from `bridge/config/wingpu.local.toml`
+1. committed defaults from `bridge/config/wingpu.defaults.toml` or the packaged copy
+2. active local override, selected in this order:
+   - `WINGPU_CONFIG_FILE`, when set
+   - `~/.config/wingpu/wingpu.local.toml`, or `$XDG_CONFIG_HOME/wingpu/wingpu.local.toml` when `XDG_CONFIG_HOME` is set
+   - `bridge/config/wingpu.local.toml`, when run from this repo or `WINGPU_PROJECT_DIR`
 3. explicit CLI or environment overrides
 
-The project-local config is the real working config for your machine.
+The home-directory config is the central machine config for both installed and repo-local `wingpu` commands. The project-local config is a fallback for isolated checkouts or one-off experiments.
 
 Typical local fields to set:
 
@@ -147,7 +150,12 @@ Typical local fields to set:
 - `paths.remote_src_root`
 - `paths.remote_models_root`
 
-If you use the installed `wingpu` command outside the repo root, set `WINGPU_PROJECT_DIR` to the project or `bridge/` directory so the CLI can still locate the project-local config.
+Create or inspect the home-directory config with:
+
+```bash
+wingpu config init --global
+wingpu config path --global
+```
 
 ## 5. First-Time Setup
 
@@ -185,11 +193,11 @@ Install the CLI:
 uv tool install --from ./bridge/mac wingpu
 ```
 
-Create the project-local config:
+Create the central user config:
 
 ```bash
-wingpu config init
-$EDITOR bridge/config/wingpu.local.toml
+wingpu config init --global
+$EDITOR ~/.config/wingpu/wingpu.local.toml
 ```
 
 ### Model catalog vs selected model
@@ -290,9 +298,13 @@ Use it when you want:
 - clean comparison runs
 - fewer experimental variables
 
+This lane is not a drop-in replacement for `turboquant-cuda` while the active setup depends on TurboQuant-specific KV cache types such as `turbo3_0`.
+Only switch the daily runtime back to official upstream once those cache types, or an equivalent long-context memory path, are supported there.
+
 ### `turboquant-cuda`
 
 CUDA-focused TurboQuant fork used for KV-cache experiments.
+This lane is a customized fork and should be updated conservatively: pull/rebuild its custom branch when that branch is available, but do not replace it with official upstream just because upstream is newer.
 
 Use it when you want:
 
@@ -307,6 +319,7 @@ This lane is experimental and should be treated accordingly.
 These areas are intentionally not part of the published surface:
 
 - `bridge/config/wingpu.local.toml`
+- `~/.config/wingpu/wingpu.local.toml`
 - `bridge/profiles/*.json` except `template.json`
 - `bridge/reports/`
 - `bridge/remote-only/wsl-llama/`

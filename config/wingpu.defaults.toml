@@ -1,5 +1,6 @@
 # This file is the committed default template.
-# Put machine-specific overrides in bridge/config/wingpu.local.toml.
+# Put machine-specific overrides in bridge/config/wingpu.local.toml
+# or ~/.config/wingpu/wingpu.local.toml.
 
 [paths]
 remote_home = "/home/your-wsl-user"
@@ -20,10 +21,12 @@ server_alive_count_max = 3
 listen_host = "127.0.0.1"
 backend_host = "127.0.0.1"
 backend_local_port = 18000
+backend_tunnel_target_host = "auto"
 idle_offload_enabled = true
 idle_timeout_seconds = 1800
 idle_poll_seconds = 5
 request_timeout_seconds = 1800
+client_read_timeout_seconds = 60
 restart_mode = "on_demand"
 
 [runtime_defaults]

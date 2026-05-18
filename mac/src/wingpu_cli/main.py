@@ -27,6 +27,7 @@ from typing import Any
 
 BRIDGE_DIR = Path(__file__).resolve().parents[3]
 PROJECT_CONFIG_FILENAME = "wingpu.local.toml"
+GLOBAL_CONFIG_DIRNAME = "wingpu"
 
 CACHE_TYPE_ALIASES = {
     "turbo2_0": "turbo2",
@@ -37,6 +38,13 @@ CACHE_TYPE_ALIASES = {
 
 class WingpuError(RuntimeError):
     pass
+
+
+class ProxyAttemptError(RuntimeError):
+    def __init__(self, stage: str, exc: Exception) -> None:
+        super().__init__(str(exc))
+        self.stage = stage
+        self.exc = exc
 
 
 @dataclass(slots=True)
@@ -74,10 +82,12 @@ class GatewayConfig:
     listen_host: str = "127.0.0.1"
     backend_host: str = "127.0.0.1"
     backend_local_port: int = 18000
+    backend_tunnel_target_host: str = "auto"
     idle_offload_enabled: bool = True
     idle_timeout_seconds: int = 1800
     idle_poll_seconds: int = 5
     request_timeout_seconds: int = 1800
+    client_read_timeout_seconds: int = 60
     restart_mode: str = "on_demand"
 
 
@@ -162,7 +172,7 @@ class Settings:
     state: StateConfig
     catalog_file: str = "package://wingpu_cli.resources/qwen_gguf_catalog.json"
     defaults_file: str = "package://wingpu_cli.resources/wingpu.defaults.toml"
-    project_config_file: str | None = None
+    active_config_file: str | None = None
 
     @property
     def backend_tunnel_socket(self) -> Path:
@@ -213,7 +223,7 @@ def resolve_paths_config(raw_paths: dict[str, Any]) -> dict[str, str]:
 
 
 @lru_cache(maxsize=1)
-def discover_bridge_dir() -> Path | None:
+def discover_project_bridge_dir() -> Path | None:
     project_override = os.getenv("WINGPU_PROJECT_DIR")
     if project_override:
         override = Path(project_override).expanduser().resolve()
@@ -231,6 +241,14 @@ def discover_bridge_dir() -> Path | None:
             return direct
         if (nested / "config" / "wingpu.defaults.toml").exists() and (nested / "mac" / "pyproject.toml").exists():
             return nested
+    return None
+
+
+@lru_cache(maxsize=1)
+def discover_bridge_dir() -> Path | None:
+    explicit = discover_project_bridge_dir()
+    if explicit is not None:
+        return explicit
     if (BRIDGE_DIR / "config" / "wingpu.defaults.toml").exists():
         return BRIDGE_DIR
     return None
@@ -243,12 +261,47 @@ def repo_config_dir() -> Path | None:
     return bridge_dir / "config"
 
 
+def global_config_dir() -> Path:
+    xdg_config_home = os.getenv("XDG_CONFIG_HOME")
+    base = Path(xdg_config_home).expanduser() if xdg_config_home else Path.home() / ".config"
+    return base / GLOBAL_CONFIG_DIRNAME
+
+
+def global_config_path(filename: str = PROJECT_CONFIG_FILENAME) -> Path:
+    return global_config_dir() / filename
+
+
+def env_config_path() -> Path | None:
+    override = os.getenv("WINGPU_CONFIG_FILE")
+    return Path(override).expanduser().resolve() if override else None
+
+
+def active_local_config_path() -> Path | None:
+    env_path = env_config_path()
+    if env_path is not None:
+        return env_path
+    global_path = global_config_path()
+    if global_path.exists():
+        return global_path
+    project_path = project_config_path()
+    if project_path is not None and project_path.exists():
+        return project_path
+    return project_path or global_path
+
+
 def config_file_path(filename: str) -> Path | None:
+    if filename == PROJECT_CONFIG_FILENAME:
+        candidate = active_local_config_path()
+        return candidate if candidate is not None and candidate.exists() else None
     config_dir = repo_config_dir()
-    if config_dir is None:
-        return None
-    candidate = config_dir / filename
-    return candidate if candidate.exists() else None
+    candidates = []
+    if config_dir is not None:
+        candidates.append(config_dir / filename)
+    candidates.append(global_config_path(filename))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def config_source_label(filename: str) -> str:
@@ -266,21 +319,21 @@ def read_config_bytes(filename: str) -> bytes:
 
 
 def project_config_path() -> Path | None:
-    config_dir = repo_config_dir()
-    if config_dir is None:
+    bridge_dir = discover_project_bridge_dir()
+    if bridge_dir is None:
         return None
-    return config_dir / PROJECT_CONFIG_FILENAME
+    return bridge_dir / "config" / PROJECT_CONFIG_FILENAME
 
 
 def load_settings(host: str | None = None, distro: str | None = None, api_key: str | None = None) -> Settings:
     config = tomllib.loads(read_config_bytes("wingpu.defaults.toml").decode("utf-8"))
-    local_project_config = project_config_path()
-    if local_project_config is None or not local_project_config.exists():
+    local_config = active_local_config_path()
+    if local_config is None or not local_config.exists():
         raise WingpuError(
-            "Missing project-local wingpu.local.toml. Run wingpu from the bridge project, set WINGPU_PROJECT_DIR, "
-            "or create bridge/config/wingpu.local.toml."
+            "Missing wingpu.local.toml. Run wingpu config init --global, run from the bridge project, "
+            "set WINGPU_PROJECT_DIR, or set WINGPU_CONFIG_FILE."
         )
-    with local_project_config.open("rb") as handle:
+    with local_config.open("rb") as handle:
         config = merge_dicts(config, tomllib.load(handle))
 
     env_overrides: dict[str, Any] = {"connection": {}, "gateway": {}, "runtime_defaults": {}, "paths": {}}
@@ -308,6 +361,8 @@ def load_settings(host: str | None = None, distro: str | None = None, api_key: s
         env_overrides["gateway"]["idle_poll_seconds"] = int(os.environ["WINGPU_IDLE_POLL_SECONDS"])
     if os.getenv("WINGPU_GATEWAY_REQUEST_TIMEOUT_SECONDS"):
         env_overrides["gateway"]["request_timeout_seconds"] = int(os.environ["WINGPU_GATEWAY_REQUEST_TIMEOUT_SECONDS"])
+    if os.getenv("WINGPU_CLIENT_READ_TIMEOUT_SECONDS"):
+        env_overrides["gateway"]["client_read_timeout_seconds"] = int(os.environ["WINGPU_CLIENT_READ_TIMEOUT_SECONDS"])
     if os.getenv("WINGPU_RESTART_MODE"):
         env_overrides["gateway"]["restart_mode"] = os.environ["WINGPU_RESTART_MODE"]
     if os.getenv("SERVED_MODEL_NAME"):
@@ -340,10 +395,16 @@ def load_settings(host: str | None = None, distro: str | None = None, api_key: s
     config["runtimes"] = interpolate_value(config["runtimes"], paths_resolved)
 
     state_dir = Path(config["state"]["state_dir"]).expanduser()
+    validate_extra_server_args(
+        list(config["runtime_defaults"].get("extra_server_args", [])),
+        source_label="runtime_defaults.extra_server_args",
+    )
     runtimes = {
         runtime_id: RuntimeLane(**runtime_cfg)
         for runtime_id, runtime_cfg in config["runtimes"].items()
     }
+    for runtime_id, lane in runtimes.items():
+        validate_extra_server_args(lane.extra_server_args, source_label=f"runtimes.{runtime_id}.extra_server_args")
     return Settings(
         connection=ConnectionConfig(**config["connection"]),
         gateway=GatewayConfig(**config["gateway"]),
@@ -365,7 +426,7 @@ def load_settings(host: str | None = None, distro: str | None = None, api_key: s
         ),
         catalog_file=config_source_label("qwen_gguf_catalog.json"),
         defaults_file=config_source_label("wingpu.defaults.toml"),
-        project_config_file=str(local_project_config) if local_project_config is not None else None,
+        active_config_file=str(local_config) if local_config is not None else None,
     )
 
 
@@ -559,14 +620,20 @@ def run(
     input_text: str | None = None,
     check: bool = True,
     capture_output: bool = True,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        argv,
-        input=input_text,
-        text=True,
-        capture_output=capture_output,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            argv,
+            input=input_text,
+            text=True,
+            capture_output=capture_output,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        command = " ".join(shlex.quote(part) for part in argv)
+        raise WingpuError(f"Command timed out after {timeout:g}s: {command}") from exc
     if check and result.returncode != 0:
         command = " ".join(shlex.quote(part) for part in argv)
         stderr = result.stderr.strip()
@@ -576,28 +643,37 @@ def run(
     return result
 
 
+def ssh_options(settings: Settings) -> list[str]:
+    return [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={settings.connection.ssh_connect_timeout}",
+        "-o",
+        f"ServerAliveInterval={settings.connection.server_alive_interval}",
+        "-o",
+        f"ServerAliveCountMax={settings.connection.server_alive_count_max}",
+    ]
+
+
 def ssh_base_args(settings: Settings) -> list[str]:
-    return ["ssh", settings.connection.host]
+    return ["ssh", *ssh_options(settings), settings.connection.host]
 
 
 def check_ssh_connectivity(settings: Settings) -> None:
     print(f"[1/4] Checking SSH connectivity to {settings.connection.host}...")
-    run(
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            f"ConnectTimeout={settings.connection.ssh_connect_timeout}",
-            settings.connection.host,
-            "echo ok",
-        ]
-    )
+    run(ssh_base_args(settings) + ["echo ok"], timeout=settings.connection.ssh_connect_timeout + 5)
 
 
-def run_wsl_script(settings: Settings, script: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_wsl_script(
+    settings: Settings,
+    script: str,
+    *,
+    check: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     remote_command = f"wsl -d {shlex.quote(settings.connection.distro)} -- env COLUMNS=120 LINES=40 bash -seuo pipefail"
-    return run(ssh_base_args(settings) + [remote_command], input_text=script, check=check)
+    return run(ssh_base_args(settings) + [remote_command], input_text=script, check=check, timeout=timeout)
 
 
 def local_api_json(settings: Settings, path: str) -> dict[str, Any]:
@@ -627,6 +703,37 @@ def backend_api_json(settings: Settings, path: str) -> dict[str, Any]:
         return json.load(response)
 
 
+def validate_extra_server_args(args: list[str], *, source_label: str) -> None:
+    managed_flags = {
+        "-m",
+        "--model",
+        "--alias",
+        "--host",
+        "--port",
+        "-c",
+        "--ctx-size",
+        "-t",
+        "--threads",
+        "-ngl",
+        "--n-gpu-layers",
+        "--api-key",
+        "-ctk",
+        "--cache-type-k",
+        "-ctv",
+        "--cache-type-v",
+        "-fa",
+        "--flash-attn",
+        "--jinja",
+    }
+    conflicting = [arg for arg in args if arg in managed_flags]
+    if conflicting:
+        rendered = ", ".join(conflicting)
+        raise WingpuError(
+            f"{source_label} includes flags managed by wingpu: {rendered}. "
+            "Set these via wingpu config fields instead of extra_server_args."
+        )
+
+
 def resolve_remote_path(settings: Settings, path: str) -> str:
     if path == "~":
         return settings.paths.remote_home
@@ -647,15 +754,39 @@ def remote_runtime_log_file(settings: Settings, runtime_id: str) -> str:
     return f"{remote_runtime_base_dir(settings)}/logs/{runtime_id}.log"
 
 
+def wsl_guest_ip(settings: Settings) -> str:
+    result = run(
+        ssh_base_args(settings) + ["wsl", "-d", settings.connection.distro, "--", "hostname", "-I"],
+        timeout=settings.connection.ssh_connect_timeout + 10,
+    )
+    for value in (result.stdout or "").split():
+        try:
+            parsed = value.split("/", 1)[0]
+            socket.inet_aton(parsed)
+        except OSError:
+            continue
+        if parsed != "127.0.0.1":
+            return parsed
+    raise WingpuError(f"Unable to determine WSL IP address for distro {settings.connection.distro}.")
+
+
+def backend_tunnel_target_host(settings: Settings) -> str:
+    configured = settings.gateway.backend_tunnel_target_host
+    if configured.lower() in {"auto", "wsl", "wsl-ip"}:
+        return wsl_guest_ip(settings)
+    return configured
+
+
 def ensure_backend_tunnel(settings: Settings) -> None:
+    target_host = backend_tunnel_target_host(settings)
     print(
         f"[3/4] Ensuring backend SSH tunnel localhost:{settings.gateway.backend_local_port} -> "
-        f"{settings.connection.host}:127.0.0.1:{settings.connection.remote_port} ..."
+        f"{settings.connection.host}:{target_host}:{settings.connection.remote_port} ..."
     )
     settings.state.state_dir.mkdir(parents=True, exist_ok=True)
     sock = str(settings.backend_tunnel_socket)
-    check_cmd = ["ssh", "-S", sock, "-O", "check", settings.connection.host]
-    if run(check_cmd, check=False).returncode == 0:
+    check_cmd = ["ssh", *ssh_options(settings), "-S", sock, "-O", "check", settings.connection.host]
+    if run(check_cmd, check=False, timeout=settings.connection.ssh_connect_timeout + 5).returncode == 0:
         print("Managed backend tunnel already running.")
         return
 
@@ -670,21 +801,18 @@ def ensure_backend_tunnel(settings: Settings) -> None:
         "-M",
         "-S",
         sock,
+        *ssh_options(settings),
         "-o",
         "ExitOnForwardFailure=yes",
-        "-o",
-        f"ServerAliveInterval={settings.connection.server_alive_interval}",
-        "-o",
-        f"ServerAliveCountMax={settings.connection.server_alive_count_max}",
         "-E",
         str(settings.backend_tunnel_log_file),
         "-L",
-        f"{settings.gateway.backend_local_port}:127.0.0.1:{settings.connection.remote_port}",
+        f"{settings.gateway.backend_local_port}:{target_host}:{settings.connection.remote_port}",
         settings.connection.host,
     ]
-    run(start_cmd)
+    run(start_cmd, timeout=settings.connection.ssh_connect_timeout + 10)
     time.sleep(1)
-    if run(check_cmd, check=False).returncode != 0:
+    if run(check_cmd, check=False, timeout=settings.connection.ssh_connect_timeout + 5).returncode != 0:
         tunnel_log = settings.backend_tunnel_log_file.read_text(encoding="utf-8", errors="ignore")
         raise WingpuError(f"Failed to establish managed backend SSH tunnel.\n{tunnel_log}")
     pid = port_listener_pid(settings.gateway.backend_local_port)
@@ -694,7 +822,11 @@ def ensure_backend_tunnel(settings: Settings) -> None:
 
 def stop_backend_tunnel(settings: Settings) -> None:
     print("[1/2] Stopping backend SSH tunnel...")
-    run(["ssh", "-S", str(settings.backend_tunnel_socket), "-O", "exit", settings.connection.host], check=False)
+    run(
+        ["ssh", *ssh_options(settings), "-S", str(settings.backend_tunnel_socket), "-O", "exit", settings.connection.host],
+        check=False,
+        timeout=settings.connection.ssh_connect_timeout + 5,
+    )
     settings.backend_tunnel_socket.unlink(missing_ok=True)
     settings.backend_tunnel_pid_file.unlink(missing_ok=True)
 
@@ -723,7 +855,7 @@ docker rm -f llama-server-qwen >/dev/null 2>&1 || true
 pkill -f '/llama-server .*--port {settings.connection.remote_port}' >/dev/null 2>&1 || true
 echo remote_runtime_stopped
 """
-    result = run_wsl_script(settings, script, check=False)
+    result = run_wsl_script(settings, script, check=False, timeout=30)
     output = (result.stdout or "").strip()
     if output:
         print(output)
@@ -779,7 +911,7 @@ if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   exit 1
 fi
 """
-    run_wsl_script(settings, script)
+    run_wsl_script(settings, script, timeout=60)
 
 
 def runtime_process_info(settings: Settings, runtime_id: str | None = None) -> dict[str, Any]:
@@ -799,7 +931,7 @@ if [[ -f "$PID_FILE" ]]; then
 fi
 printf '{{"running":false,"pid":null,"log_file":"%s","cmd":""}}\\n' "$LOG_FILE"
 """
-    result = run_wsl_script(settings, script, check=False)
+    result = run_wsl_script(settings, script, check=False, timeout=20)
     try:
         return json.loads((result.stdout or "").strip().splitlines()[-1])
     except Exception:
@@ -830,6 +962,7 @@ def wait_for_backend_api(settings: Settings, runtime_id: str, model_name: str, c
         settings,
         f"tail -n 120 {shlex.quote(remote_runtime_log_file(settings, runtime_id))} || true",
         check=False,
+        timeout=20,
     )
     detail = (log_result.stdout or "").strip()
     raise WingpuError(f"llama-server did not become ready in time.\n{detail}")
@@ -1161,6 +1294,10 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
     def coordinator(self) -> GatewayCoordinator:
         return self.server.coordinator  # type: ignore[attr-defined]
 
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(self.coordinator.settings.gateway.client_read_timeout_seconds)
+
     def log_message(self, format: str, *args: Any) -> None:
         sys.stdout.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), format % args))
         sys.stdout.flush()
@@ -1263,6 +1400,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 http.client.RemoteDisconnected,
                 ConnectionResetError,
                 ConnectionAbortedError,
+                ConnectionRefusedError,
                 BrokenPipeError,
                 TimeoutError,
                 socket.timeout,
@@ -1272,10 +1410,42 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         message = str(exc).lower()
         return "remote end closed connection without response" in message or "connection reset" in message
 
-    def _proxy_once(self) -> None:
-        self.coordinator.ensure_runtime_loaded()
+    def _read_request_body(self) -> bytes | None:
         content_length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(content_length) if content_length else None
+        if content_length <= 0:
+            return None
+        try:
+            body = self.rfile.read(content_length)
+        except socket.timeout as exc:
+            raise WingpuError("Timed out while reading request body from client.") from exc
+        if body is None:
+            return None
+        if len(body) != content_length:
+            raise WingpuError(
+                f"Incomplete request body from client: expected {content_length} bytes, got {len(body)}."
+            )
+        return body
+
+    def _should_retry_proxy_request(self) -> bool:
+        return self.command in {"GET", "HEAD", "OPTIONS"}
+
+    def _can_retry_proxy_attempt(self, error: ProxyAttemptError) -> bool:
+        if not self._is_retryable_proxy_error(error.exc):
+            return False
+        if error.stage == "connect":
+            return True
+        return self._should_retry_proxy_request() and error.stage in {"send_request", "await_response"}
+
+    def _unsafe_retry_message(self, error: ProxyAttemptError) -> str:
+        if error.stage in {"send_request", "await_response", "stream_response"}:
+            return (
+                f"Backend connection dropped after request was sent while handling {self.command}; "
+                "request was not retried automatically to avoid duplicate execution."
+            )
+        return f"Backend connection dropped while handling {self.command}: {error.exc}"
+
+    def _proxy_once(self, body: bytes | None) -> None:
+        self.coordinator.ensure_runtime_loaded()
         headers = {
             key: value
             for key, value in self.headers.items()
@@ -1299,8 +1469,18 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             self.coordinator.settings.gateway.backend_local_port,
             timeout=self.coordinator.settings.gateway.request_timeout_seconds,
         )
-        conn.request(self.command, self.path, body=body, headers=headers)
-        resp = conn.getresponse()
+        try:
+            conn.connect()
+        except Exception as exc:
+            raise ProxyAttemptError("connect", exc) from exc
+        try:
+            conn.request(self.command, self.path, body=body, headers=headers)
+        except Exception as exc:
+            raise ProxyAttemptError("send_request", exc) from exc
+        try:
+            resp = conn.getresponse()
+        except Exception as exc:
+            raise ProxyAttemptError("await_response", exc) from exc
         self.send_response(resp.status, resp.reason)
         for key, value in resp.getheaders():
             if key.lower() in {
@@ -1318,26 +1498,32 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             self.send_header(key, value)
         self.send_header("Connection", "close")
         self.end_headers()
-        while True:
-            chunk = resp.read(64 * 1024)
-            if not chunk:
-                break
-            self.wfile.write(chunk)
-            self.wfile.flush()
+        try:
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except Exception as exc:
+            raise ProxyAttemptError("stream_response", exc) from exc
         self.close_connection = True
 
     def _proxy(self) -> None:
         self.coordinator.begin_request()
         try:
+            body = self._read_request_body()
             try:
-                self._proxy_once()
-            except Exception as exc:
-                if not self._is_retryable_proxy_error(exc):
-                    raise
-                self.coordinator.recover_runtime_after_proxy_error(exc)
-                self._proxy_once()
+                self._proxy_once(body)
+            except ProxyAttemptError as exc:
+                if not self._can_retry_proxy_attempt(exc):
+                    raise WingpuError(self._unsafe_retry_message(exc)) from exc.exc
+                self.coordinator.recover_runtime_after_proxy_error(exc.exc)
+                self._proxy_once(body)
         except WingpuError as exc:
             self._send_json(502, {"ok": False, "error": str(exc)})
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
         except Exception as exc:
             self._send_json(502, {"ok": False, "error": f"Gateway proxy error: {exc}"})
         finally:
@@ -1434,7 +1620,11 @@ def print_status(settings: Settings) -> None:
     print()
 
     print("== Backend tunnel ==")
-    if run(["ssh", "-S", str(settings.backend_tunnel_socket), "-O", "check", settings.connection.host], check=False).returncode == 0:
+    if run(
+        ["ssh", *ssh_options(settings), "-S", str(settings.backend_tunnel_socket), "-O", "check", settings.connection.host],
+        check=False,
+        timeout=settings.connection.ssh_connect_timeout + 5,
+    ).returncode == 0:
         print(f"Managed tunnel: active ({settings.backend_tunnel_socket})")
     else:
         print("Managed tunnel: inactive")
@@ -1501,7 +1691,7 @@ def print_kv_show(settings: Settings) -> None:
 def print_config_show(settings: Settings) -> None:
     data = {
         "defaults_file": str(settings.defaults_file),
-        "project_config_file": settings.project_config_file,
+        "active_config_file": settings.active_config_file,
         "catalog_file": str(settings.catalog_file),
         "connection": asdict(settings.connection),
         "gateway": asdict(settings.gateway),
@@ -1533,10 +1723,13 @@ def print_config_show(settings: Settings) -> None:
     print(json.dumps(data, indent=2))
 
 
-def init_config(force: bool) -> None:
-    target = project_config_path()
+def init_config(force: bool, *, global_config: bool = False) -> None:
+    target = global_config_path() if global_config else project_config_path()
     if target is None:
-        raise WingpuError("Unable to determine project-local config path from the current working directory.")
+        raise WingpuError(
+            "Unable to determine project-local config path from the current working directory. "
+            "Use wingpu config init --global for a central config."
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and not force:
         raise WingpuError(f"Config already exists: {target}")
@@ -1865,10 +2058,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     config_parser = subparsers.add_parser("config", help="Inspect or initialize wingpu config")
     config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
-    config_subparsers.add_parser("path", help="Show the project-local config path")
+    path_parser = config_subparsers.add_parser("path", help="Show the active config path")
+    path_parser.add_argument("--global", dest="global_config", action="store_true", help="Show the central config path")
     config_subparsers.add_parser("show", help="Show the merged active config")
-    init_parser = config_subparsers.add_parser("init", help="Write the project-local config template")
+    init_parser = config_subparsers.add_parser("init", help="Write a wingpu.local.toml template")
     init_parser.add_argument("--force", action="store_true", help="Overwrite existing config")
+    init_parser.add_argument("--global", dest="global_config", action="store_true", help="Write the central user config")
 
     internal_gateway = subparsers.add_parser("__gateway_serve", help=argparse.SUPPRESS)
     internal_gateway.set_defaults(internal_gateway=True)
@@ -1879,9 +2074,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    settings = load_settings(host=args.host, distro=args.distro, api_key=args.api_key)
 
     try:
+        if args.command == "config" and args.config_command == "path":
+            target = global_config_path() if args.global_config else active_local_config_path()
+            if target is None:
+                raise WingpuError("Unable to determine wingpu config path.")
+            print(target)
+            return 0
+        if args.command == "config" and args.config_command == "init":
+            init_config(force=args.force, global_config=args.global_config)
+            return 0
+
+        settings = load_settings(host=args.host, distro=args.distro, api_key=args.api_key)
+
         if args.command == "__gateway_serve":
             serve_gateway(settings)
         elif args.command == "start":
@@ -1991,15 +2197,8 @@ def main(argv: list[str] | None = None) -> int:
                 lane = runtime_lane(settings, runtime_id)
                 run_admin_wrapper(settings, "wingpu-install-llamacpp-system", f"{lane.build_dir}/bin")
         elif args.command == "config":
-            if args.config_command == "path":
-                target = project_config_path()
-                if target is None:
-                    raise WingpuError("Unable to determine project-local config path from the current working directory.")
-                print(target)
-            elif args.config_command == "show":
+            if args.config_command == "show":
                 print_config_show(settings)
-            elif args.config_command == "init":
-                init_config(force=args.force)
         return 0
     except WingpuError as exc:
         print(str(exc), file=sys.stderr)

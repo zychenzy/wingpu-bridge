@@ -2,9 +2,33 @@
   "model_root": "{remote_models_root}",
   "default_model": "Qwen3.6-35B-A3B-UD-IQ3_S",
   "models": {
+    "Qwen3.6-27B-Q3_K_M": {
+      "gguf_relpath": "Qwen3.6-27B-GGUF/Qwen3.6-27B-Q3_K_M.gguf",
+      "context_length": 131072,
+      "enabled": true,
+      "notes": "27B Q3_K_M variant for a slightly higher-quality option within the Qwen3.6 GGUF set."
+    },
+    "Qwen3.6-27B-Q3_K_S": {
+      "gguf_relpath": "Qwen3.6-27B-GGUF/Qwen3.6-27B-Q3_K_S.gguf",
+      "context_length": 131072,
+      "enabled": true,
+      "notes": "27B Q3_K_S variant for a smaller, faster long-context option within the Qwen3.6 GGUF set."
+    },
+    "Qwen3.6-27B-UD-IQ2_M": {
+      "gguf_relpath": "Qwen3.6-27B-GGUF/Qwen3.6-27B-UD-IQ2_M.gguf",
+      "context_length": 131072,
+      "enabled": true,
+      "notes": "27B UD IQ2_M variant for testing lower-VRAM long-context behavior on TurboQuant."
+    },
+    "Qwen3.6-27B-UD-IQ2_XXS": {
+      "gguf_relpath": "Qwen3.6-27B-GGUF/Qwen3.6-27B-UD-IQ2_XXS.gguf",
+      "context_length": 131072,
+      "enabled": true,
+      "notes": "27B UD IQ2_XXS variant for testing the smallest practical long-context 27B option on TurboQuant."
+    },
     "Qwen3.6-35B-A3B-UD-IQ3_S": {
       "gguf_relpath": "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
-      "context_length": 131072,
+      "context_length": 262144,
       "enabled": true,
       "notes": "35B A3B UD IQ3_S variant for good balance with high quality and speed within the new Qwen3.6 GGUF set."
     },

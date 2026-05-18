@@ -49,12 +49,15 @@ The published project keeps one stable app contract:
 uv tool install --from ./bridge/mac wingpu
 ```
 
-2. Create the project-local config:
+2. Create the central user config:
 
 ```bash
-wingpu config init
-$EDITOR bridge/config/wingpu.local.toml
+wingpu config init --global
+$EDITOR ~/.config/wingpu/wingpu.local.toml
 ```
+
+`wingpu` uses `~/.config/wingpu/wingpu.local.toml`, or `WINGPU_CONFIG_FILE` if set.
+The repo-local `bridge/config/wingpu.local.toml` is only a fallback when the central config is missing.
 
 3. Build or select a runtime and model:
 
@@ -112,6 +115,7 @@ wingpu model current
 These paths are intentionally kept out of git so the repo can stay publishable while your machine-specific work stays local:
 
 - `bridge/config/wingpu.local.toml`
+- `~/.config/wingpu/wingpu.local.toml`
 - `bridge/profiles/*.json` except `template.json`
 - `bridge/reports/`
 - `bridge/remote-only/wsl-llama/`
