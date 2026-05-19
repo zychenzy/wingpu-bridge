@@ -63,9 +63,9 @@ The repo-local `bridge/config/wingpu.local.toml` is only a fallback when the cen
 
 ```bash
 wingpu build upstream
-wingpu runtime set turboquant-cuda
-wingpu model set Qwen3.6-35B-A3B-UD-IQ3_S
-wingpu kv set --k turbo3 --v turbo3
+wingpu runtime set upstream-mtp
+wingpu model set Qwen3.6-27B-MTP-UD-IQ2_M
+wingpu kv set --k q4_0 --v q4_0
 ```
 
 4. Start and verify the local endpoint:
@@ -109,6 +109,17 @@ wingpu model current
 ## Read This Next
 
 - [Project Guide](docs/README.md)
+
+## TurboQuant Fallback
+
+The default lane is the upstream MTP setup. To switch the bridge back to the TurboQuant long-context fallback:
+
+```bash
+wingpu runtime set turboquant-cuda
+wingpu model set Qwen3.6-27B-UD-IQ2_M
+wingpu kv set --k turbo3 --v turbo3
+wingpu restart
+```
 
 ## Local-Only Areas
 

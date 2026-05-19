@@ -245,11 +245,11 @@ wingpu build turboquant-cuda
 ```bash
 wingpu model list
 wingpu model current
-wingpu model set Qwen3.6-35B-A3B-UD-IQ3_S
+wingpu model set Qwen3.6-27B-MTP-UD-IQ2_M
 wingpu runtime list
-wingpu runtime set turboquant-cuda
+wingpu runtime set upstream-mtp
 wingpu kv show
-wingpu kv set --k turbo3 --v turbo3
+wingpu kv set --k q4_0 --v q4_0
 ```
 
 ### Start and verify
@@ -301,6 +301,18 @@ Use it when you want:
 This lane is not a drop-in replacement for `turboquant-cuda` while the active setup depends on TurboQuant-specific KV cache types such as `turbo3_0`.
 Only switch the daily runtime back to official upstream once those cache types, or an equivalent long-context memory path, are supported there.
 
+### `upstream-mtp`
+
+Native upstream `llama.cpp` with Qwen3.6 MTP speculative decoding enabled through `--spec-type draft-mtp`.
+
+Use it when you want:
+
+- the default bridge runtime
+- faster long-context decode throughput
+- the current 27B MTP model path on the 16 GiB GPU
+
+The current default uses `Qwen3.6-27B-MTP-UD-IQ2_M` with `q4_0` K/V cache and `--spec-draft-n-max 3`.
+
 ### `turboquant-cuda`
 
 CUDA-focused TurboQuant fork used for KV-cache experiments.
@@ -313,6 +325,15 @@ Use it when you want:
 - TurboQuant vs baseline benchmarks
 
 This lane is experimental and should be treated accordingly.
+
+To switch back to TurboQuant from the MTP default:
+
+```bash
+wingpu runtime set turboquant-cuda
+wingpu model set Qwen3.6-27B-UD-IQ2_M
+wingpu kv set --k turbo3 --v turbo3
+wingpu restart
+```
 
 ## 9. Local-Only Working Areas
 

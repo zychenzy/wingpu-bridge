@@ -30,7 +30,7 @@ client_read_timeout_seconds = 60
 restart_mode = "on_demand"
 
 [runtime_defaults]
-default_runtime = "turboquant-cuda"
+default_runtime = "upstream-mtp"
 served_model_name = "qwen-local"
 n_gpu_layers = 99
 threads = 8
@@ -39,8 +39,8 @@ build_jobs = 8
 cuda_architectures = "89"
 flash_attn = true
 remote_state_dir = "~/.gpu-bridge"
-default_cache_type_k = "turbo3_0"
-default_cache_type_v = "turbo3_0"
+default_cache_type_k = "q4_0"
+default_cache_type_v = "q4_0"
 cmake_args = [
   "-DGGML_CUDA=ON",
   "-DGGML_NATIVE=OFF",
@@ -59,6 +59,17 @@ default_branch = "master"
 supported_cache_types = ["f16", "bf16", "q8_0", "q4_0", "q4_1"]
 extra_server_args = []
 notes = "Upstream llama.cpp CUDA baseline."
+
+[runtimes."upstream-mtp"]
+kind = "native"
+source_dir = "{remote_src_root}/llama.cpp"
+build_dir = "{remote_src_root}/llama.cpp/build-cuda89"
+server_bin = "{remote_src_root}/llama.cpp/build-cuda89/bin/llama-server"
+bench_bin = "{remote_src_root}/llama.cpp/build-cuda89/bin/llama-bench"
+default_branch = "master"
+supported_cache_types = ["f16", "bf16", "q8_0", "q4_0", "q4_1"]
+extra_server_args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "3"]
+notes = "Upstream llama.cpp with Qwen3.6 MTP speculative decoding enabled."
 
 [runtimes."turboquant-cuda"]
 kind = "native"

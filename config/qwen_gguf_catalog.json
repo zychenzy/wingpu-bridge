@@ -1,6 +1,6 @@
 {
   "model_root": "{remote_models_root}",
-  "default_model": "Qwen3.6-35B-A3B-UD-IQ3_S",
+  "default_model": "Qwen3.6-27B-MTP-UD-IQ2_M",
   "models": {
     "Qwen3.6-27B-Q3_K_M": {
       "gguf_relpath": "Qwen3.6-27B-GGUF/Qwen3.6-27B-Q3_K_M.gguf",
@@ -25,6 +25,24 @@
       "context_length": 131072,
       "enabled": true,
       "notes": "27B UD IQ2_XXS variant for testing the smallest practical long-context 27B option on TurboQuant."
+    },
+    "Qwen3.6-27B-MTP-Q3_K_S": {
+      "gguf_relpath": "Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-Q3_K_S.gguf",
+      "context_length": 131072,
+      "enabled": true,
+      "notes": "27B MTP Q3_K_S variant for highest-quality MTP attempts that may still fit only at shorter contexts on 16 GiB GPUs."
+    },
+    "Qwen3.6-27B-MTP-UD-IQ2_M": {
+      "gguf_relpath": "Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-IQ2_M.gguf",
+      "context_length": 131072,
+      "enabled": true,
+      "notes": "27B MTP UD IQ2_M variant selected as the main 16 GiB long-context MTP candidate."
+    },
+    "Qwen3.6-27B-MTP-UD-IQ2_XXS": {
+      "gguf_relpath": "Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-IQ2_XXS.gguf",
+      "context_length": 131072,
+      "enabled": true,
+      "notes": "27B MTP UD IQ2_XXS fallback for VRAM-constrained 100K-130K context experiments."
     },
     "Qwen3.6-35B-A3B-UD-IQ3_S": {
       "gguf_relpath": "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
