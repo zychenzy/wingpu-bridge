@@ -212,7 +212,11 @@ def cmd_api(args: argparse.Namespace, db: BridgeDB, bridge_dir: Path, profiles_d
             return 0
 
         if action == "cancel":
-            row = db.request_cancel(payload["job_id"])
+            job_id = payload.get("job_id")
+            if not job_id:
+                render({"ok": False, "error": "job_id is required for cancel"})
+                return 2
+            row = db.request_cancel(job_id)
             render({"ok": True, "job": row})
             return 0
 

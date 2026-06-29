@@ -24,8 +24,8 @@ Wants=docker.service
 [Service]
 Type=simple
 User=$USER
-WorkingDirectory=$PREFIX
-ExecStart=/usr/bin/env python3 $PREFIX/worker.py --db $PREFIX/state/bridge.db
+WorkingDirectory="$PREFIX"
+ExecStart=/usr/bin/env python3 "$PREFIX/worker.py" --db "$PREFIX/state/bridge.db"
 Restart=always
 RestartSec=3
 

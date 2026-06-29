@@ -2,7 +2,7 @@
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   error TEXT,
   retry_count INTEGER NOT NULL DEFAULT 0,
   max_retries INTEGER NOT NULL DEFAULT 0,
-  cancel_requested INTEGER NOT NULL DEFAULT 0
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  retry_after TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_state_created ON jobs(state, created_at);
@@ -55,6 +56,7 @@ class BridgeDB:
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -136,7 +138,8 @@ class BridgeDB:
     def claim_next(self) -> Optional[Dict[str, Any]]:
         with self.tx() as conn:
             row = conn.execute(
-                "SELECT * FROM jobs WHERE state = 'queued' ORDER BY created_at ASC LIMIT 1"
+                "SELECT * FROM jobs WHERE state = 'queued' AND (retry_after IS NULL OR retry_after <= ?) ORDER BY created_at ASC LIMIT 1",
+                (self.now_iso(),),
             ).fetchone()
             if not row:
                 return None
@@ -165,14 +168,15 @@ class BridgeDB:
 
     def request_cancel(self, job_id: str) -> Dict[str, Any]:
         with self.tx() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if not row:
+                raise ValueError(f"Job not found: {job_id}")
             conn.execute(
                 "UPDATE jobs SET cancel_requested = 1 WHERE job_id = ?",
                 (job_id,),
             )
             self._event(conn, job_id, "cancel_requested")
             row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-        if not row:
-            raise ValueError(f"Job not found: {job_id}")
         return self._row_to_dict(row)
 
     def finish(self, job_id: str, state: str, exit_code: Optional[int], error: str = "") -> Dict[str, Any]:
@@ -199,6 +203,7 @@ class BridgeDB:
                 raise ValueError(f"Job not found: {job_id}")
             retry_count = int(row["retry_count"])
             max_retries = int(row["max_retries"])
+            now = self.now_iso()
             if retry_count >= max_retries:
                 # No retries left; mark failed.
                 conn.execute(
@@ -207,28 +212,31 @@ class BridgeDB:
                     SET state = 'failed', ended_at = ?, error = ?, heartbeat_at = ?, exit_code = ?
                     WHERE job_id = ?
                     """,
-                    (self.now_iso(), error, self.now_iso(), exit_code, job_id),
+                    (now, error, now, exit_code, job_id),
                 )
                 self._event(conn, job_id, "failed", {"retry_count": retry_count, "max_retries": max_retries, "error": error})
             else:
                 next_retry = retry_count + 1
+                delay_seconds = min(60 * (2 ** next_retry), 600)
+                retry_after = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat()
                 conn.execute(
                     """
                     UPDATE jobs
                     SET state = 'queued', retry_count = ?, started_at = NULL, ended_at = NULL,
-                        heartbeat_at = NULL, exit_code = NULL, error = ?, cancel_requested = 0
+                        heartbeat_at = NULL, exit_code = NULL, error = ?, cancel_requested = 0,
+                        retry_after = ?
                     WHERE job_id = ?
                     """,
-                    (next_retry, error, job_id),
+                    (next_retry, error, retry_after, job_id),
                 )
-                self._event(conn, job_id, "requeued", {"retry_count": next_retry, "max_retries": max_retries, "error": error})
+                self._event(conn, job_id, "requeued", {"retry_count": next_retry, "max_retries": max_retries, "error": error, "retry_after": retry_after})
             result = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         return self._row_to_dict(result) if result else {}
 
     def mark_stale_running_as_interrupted(self, stale_seconds: int = 120) -> int:
         with self.tx() as conn:
             rows = conn.execute(
-                "SELECT job_id, heartbeat_at FROM jobs WHERE state = 'running'"
+                "SELECT job_id, heartbeat_at, retry_count, max_retries FROM jobs WHERE state = 'running'"
             ).fetchall()
             now = datetime.now(timezone.utc)
             interrupted = 0
@@ -242,11 +250,34 @@ class BridgeDB:
                     continue
                 age = (now - hb).total_seconds()
                 if age > stale_seconds:
-                    conn.execute(
-                        "UPDATE jobs SET state = 'interrupted', ended_at = ?, error = ? WHERE job_id = ?",
-                        (self.now_iso(), f"stale heartbeat ({int(age)}s)", row["job_id"]),
-                    )
-                    self._event(conn, row["job_id"], "interrupted", {"age_seconds": int(age)})
+                    now_iso = self.now_iso()
+                    retry_count = int(row["retry_count"])
+                    max_retries = int(row["max_retries"])
+                    error_msg = f"stale heartbeat ({int(age)}s)"
+                    if retry_count < max_retries:
+                        # Requeue for retry instead of leaving as interrupted.
+                        next_retry = retry_count + 1
+                        delay_seconds = min(60 * (2 ** next_retry), 600)
+                        retry_after = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat()
+                        conn.execute(
+                            """
+                            UPDATE jobs
+                            SET state = 'queued', retry_count = ?, started_at = NULL, ended_at = NULL,
+                                heartbeat_at = NULL, exit_code = NULL, error = ?, cancel_requested = 0,
+                                retry_after = ?
+                            WHERE job_id = ?
+                            """,
+                            (next_retry, error_msg, retry_after, row["job_id"]),
+                        )
+                        self._event(conn, row["job_id"], "requeued_after_interrupt", {
+                            "age_seconds": int(age), "retry_count": next_retry, "max_retries": max_retries,
+                        })
+                    else:
+                        conn.execute(
+                            "UPDATE jobs SET state = 'interrupted', ended_at = ?, error = ? WHERE job_id = ?",
+                            (now_iso, error_msg, row["job_id"]),
+                        )
+                        self._event(conn, row["job_id"], "interrupted", {"age_seconds": int(age)})
                     interrupted += 1
         return interrupted
 

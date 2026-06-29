@@ -425,6 +425,7 @@ gateway_lock_file = "gateway.lock"
             "explicit_cache_type_k": None,
             "explicit_cache_type_v": None,
             "flash_attn": None,
+            "force_gpu": False,
         })])
 
     def test_ensure_runtime_loaded_does_not_fast_path_when_runtime_process_is_missing(self):

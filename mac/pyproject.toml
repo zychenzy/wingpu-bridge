@@ -18,6 +18,7 @@ packages = ["src/wingpu_cli"]
 [tool.hatch.build.targets.wheel.force-include]
 "../config/wingpu.defaults.toml" = "src/wingpu_cli/resources/wingpu.defaults.toml"
 "../config/qwen_gguf_catalog.json" = "src/wingpu_cli/resources/qwen_gguf_catalog.json"
+"../wsl/gpu_broker.py" = "src/wingpu_cli/resources/gpu_broker.py"
 
 [tool.uv]
 package = true

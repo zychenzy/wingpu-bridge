@@ -16,6 +16,7 @@ else
   # Fallback for non-systemd environments.
   if ! pgrep -f "python3 $BRIDGE_DIR/worker.py" >/dev/null 2>&1; then
     nohup python3 "$BRIDGE_DIR/worker.py" --db "$DB_PATH" >"$BRIDGE_DIR/logs/worker.out" 2>&1 &
+    echo $! > "$BRIDGE_DIR/state/worker.pid"
   fi
 fi
 

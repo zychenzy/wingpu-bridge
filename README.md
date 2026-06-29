@@ -17,6 +17,7 @@ The published project keeps one stable app contract:
 - GGUF model catalog and model switching without changing app-side config
 - Automatic idle offload of the remote model runtime
 - Local benchmark and experiment workflows for long-context Qwen use
+- A shared GPU broker so this bridge and its siblings (`locatectl`, `ocrctl`, `minerctl`) never fight over VRAM
 
 ## System Shape
 
@@ -43,11 +44,15 @@ The published project keeps one stable app contract:
 
 ## Quick Start
 
-1. Install the CLI:
+1. Install the CLI (run from the repo root, `~/projects/bridge`):
 
 ```bash
-uv tool install --from ./bridge/mac wingpu
+uv tool install --from ./mac wingpu
 ```
+
+(This repo now lives at `~/projects/bridge`, a sibling of `~/projects/pdf-to-md` and
+`~/projects/locateanything`. If you previously installed from `autoresearch/bridge/mac`,
+reinstall with `uv tool install --force --from ./mac wingpu` from the new path.)
 
 2. Create the central user config:
 
@@ -106,6 +111,24 @@ wingpu model list
 wingpu model current
 ```
 
+## Shared GPU Broker
+
+The Windows host has one GPU shared by this bridge and its siblings. `wsl/gpu_broker.py` is a
+daemonless lease arbiter (SQLite + flock on the WSL host) that lets only one runtime hold the GPU
+at a time. Before starting `llama-server`, wingpu acquires the GPU, evicting whatever holds it and
+waiting for VRAM to drain; it releases on idle-offload and `stop`. A busy holder (judged from GPU
+utilization) is not killed unless you pass `--force-gpu`.
+
+```bash
+wingpu broker status            # who holds the GPU, VRAM, watchdog state
+wingpu broker install           # upload/refresh the broker on the WSL host
+wingpu broker evict             # manually free the GPU
+wingpu start --force-gpu        # preempt a busy holder
+```
+
+It is fail-open (a broker problem never blocks a start) and can be turned off with
+`broker.enabled = false`. Full details: [Project Guide, section 11](docs/README.md).
+
 ## Read This Next
 
 - [Project Guide](docs/README.md)
@@ -139,4 +162,4 @@ These paths are intentionally kept out of git so the repo can stay publishable w
 - `bridge/mac/`: Python `wingpu` controller and utilities
 - `bridge/profiles/`: local profile templates
 - `bridge/windows/`: Windows-side setup scripts
-- `bridge/wsl/`: older reference utilities and support scripts
+- `bridge/wsl/`: the GPU broker (`gpu_broker.py`) plus older reference utilities

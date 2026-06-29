@@ -82,6 +82,22 @@ supported_cache_types = ["f16", "bf16", "q8_0", "q4_0", "q4_1", "turbo2_0", "tur
 extra_server_args = []
 notes = "spiritbuun CUDA-focused TurboQuant fork on feature/turboquant-kv-cache."
 
+[broker]
+# Shared GPU lease arbiter on the WSL host (wsl/gpu_broker.py). It ensures only one
+# bridge (wingpu/llama, locatectl, ocrctl, minerctl) holds the GPU at a time: wingpu
+# evicts the current holder and waits for VRAM to drain before loading llama, then
+# releases the lease on idle-offload/stop. Set enabled=false to disable entirely.
+enabled = true
+runtime_id = "llama"
+# remote_dir: where gpu_broker.py + broker.db live on WSL. Empty = runtime_defaults.remote_state_dir.
+remote_dir = ""
+vram_floor_mb = 2000
+free_timeout_seconds = 60
+acquire_wait_seconds = 30
+busy_util_pct = 15
+watchdog_idle_timeout_seconds = 900
+watchdog_poll_seconds = 15
+
 [state]
 state_dir = "~/.gpu-chat-bridge"
 selected_model_file = "selected_model"

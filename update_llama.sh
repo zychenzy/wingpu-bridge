@@ -31,6 +31,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "=== Extracting wingpu settings ==="
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 # Retrieve settings using python from the wingpu package resources
 SETTINGS_JSON=$(python3 -c "
 import sys, os, json

@@ -108,8 +108,10 @@ for line in lines:
 
     if current == "boot":
         normalized = stripped.replace(" ", "").lower()
-        if normalized == "systemd=true":
+        if normalized.startswith("systemd="):
             has_systemd = True
+            if normalized != "systemd=true":
+                line = "systemd=true"
     out.append(line)
 
 if has_boot and not has_systemd:

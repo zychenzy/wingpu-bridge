@@ -120,9 +120,10 @@ PowerShell helpers for Windows host preparation:
 
 ### `bridge/wsl/`
 
-Older WSL support utilities and reference scripts.
-
-These are not the primary daily control path anymore, but they remain useful as references and experiments.
+WSL-side scripts. The live one is `gpu_broker.py`, the shared GPU lease arbiter (see section 11);
+wingpu uploads it to the GPU host and drives it over SSH. The remaining files
+(`bridge_ctl.py`, `bridge_db.py`, `worker.py`, `boot.sh`, `install.sh`) are an older Docker job
+queue kept only as reference; they are not part of the daily control path.
 
 ## 4. Configuration Model
 
@@ -187,10 +188,10 @@ wingpu admin cuda-toolkit
 
 ### Mac
 
-Install the CLI:
+Install the CLI (from the repo root, now `~/projects/bridge`):
 
 ```bash
-uv tool install --from ./bridge/mac wingpu
+uv tool install --from ./mac wingpu
 ```
 
 Create the central user config:
@@ -355,3 +356,89 @@ This keeps the repo publishable while still leaving room for local notes, mirror
 - if a build fails, rerun the relevant `wingpu admin ...` prerequisite command
 - if the runtime starts but generation fails, compare the selected KV cache types against the active runtime lane's supported cache types
 - if the installed `wingpu` command cannot find project config, run it from the repo or set `WINGPU_PROJECT_DIR`
+- if `wingpu start` reports the GPU is held by another runtime, see section 11 (`wingpu broker status`, `--force-gpu`)
+
+## 11. Shared GPU Broker
+
+The Windows host has one NVIDIA GPU shared by several sibling bridges: this one (`wingpu`,
+llama.cpp), plus `locatectl`, `ocrctl`, and `minerctl` in the neighboring repos. Each loads a
+model that does not fit in VRAM alongside the others, but historically nothing coordinated them,
+so two loaded at once meant an out-of-memory failure or an orphaned process pinning VRAM.
+
+`wsl/gpu_broker.py` is the single authority on who holds the GPU. It is daemonless: state lives in
+SQLite (`~/.gpu-bridge/broker.db`) guarded by an flock, and every command is a short-lived process.
+There is no service to keep alive.
+
+### How wingpu uses it
+
+- Before starting `llama-server`, wingpu calls `acquire`. If another runtime holds the card, the
+  broker evicts it (graceful POST shutdown if the runtime offers one, otherwise SIGTERM then
+  SIGKILL on its pidfile) and waits for VRAM to actually drain (`nvidia-smi`) before granting.
+- On idle-offload and on `wingpu stop`, wingpu calls `release`, so the holder is cleared.
+- "Busy" is judged from real GPU utilization, so an actively running generation is not killed.
+  If the holder is busy, `acquire` waits up to `broker.acquire_wait_seconds`, then fails the start
+  with a clear message. Use `wingpu start --force-gpu` to preempt a busy holder immediately.
+
+This is fail-open: if the broker is unreachable or not yet installed, wingpu prints a warning and
+starts anyway, so a broker problem never blocks normal use. Set `broker.enabled = false` to opt out
+entirely.
+
+### Commands
+
+```bash
+wingpu broker status            # who holds the GPU, VRAM use, watchdog state
+wingpu broker status --json     # same, machine-readable
+wingpu broker install           # upload/refresh gpu_broker.py on the WSL host
+wingpu broker evict             # manually free the GPU (evict the current holder)
+wingpu broker watchdog start    # start the idle-eviction loop (see below)
+wingpu broker watchdog stop
+```
+
+`wingpu status` also shows a "GPU broker" block (holder, VRAM, watchdog).
+
+### Idle watchdog
+
+`gpu_broker.py watchdog` is an optional background loop that evicts whichever runtime has gone idle,
+freeing VRAM for the whole box. It is **off by default**. wingpu already has its own gateway
+idle-offload; `locatectl` / `ocrctl` / `minerctl` (now broker-wired) do not, so the watchdog is the
+cross-bridge idle-offload for them. It is left off by default because it will evict (kill) a warm,
+idle model after `watchdog_idle_timeout_seconds`, which you may not want for a model you keep loaded.
+Enable it when you want hands-off VRAM reclamation across all four bridges:
+
+```bash
+wingpu broker watchdog start    # idle timeout + poll come from [broker] config
+wingpu broker watchdog stop
+```
+
+### Configuration (`[broker]`)
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `enabled` | `true` | Acquire/release around runtime start. Set `false` to disable. |
+| `runtime_id` | `llama` | This bridge's identity to the broker. |
+| `remote_dir` | `""` | Where `gpu_broker.py` + `broker.db` live on WSL. Empty uses `runtime_defaults.remote_state_dir` (`~/.gpu-bridge`). |
+| `vram_floor_mb` | `2000` | VRAM (MB) at/below which the card counts as freed after an eviction. |
+| `free_timeout_seconds` | `60` | Max wait for VRAM to drain after evicting a holder. |
+| `acquire_wait_seconds` | `30` | Wait this long for a busy holder to go idle before failing (use `--force-gpu` to skip). |
+| `busy_util_pct` | `15` | GPU utilization at/above which the holder counts as busy. |
+| `watchdog_idle_timeout_seconds` | `900` | Watchdog evicts a holder idle this long. |
+| `watchdog_poll_seconds` | `15` | Watchdog poll interval. |
+
+### State on the WSL host
+
+```text
+~/.gpu-bridge/
+  gpu_broker.py          uploaded broker program
+  broker.db              SQLite: current holder + event log
+  broker.lock            flock for mutual exclusion
+  run/watchdog.pid       watchdog pid (when running)
+  logs/watchdog.log      watchdog output
+```
+
+### Troubleshooting
+
+- "GPU is held by 'locate' which is busy": another bridge is actively using the card. Wait, stop
+  that bridge, or run `wingpu start --force-gpu`.
+- Stuck holder after a crash: `wingpu broker status` shows `alive=false`; the next `acquire`
+  (or `wingpu broker evict`) clears it.
+- To see the raw event log on the host: `sqlite3 ~/.gpu-bridge/broker.db 'select * from events order by id desc limit 20'`.

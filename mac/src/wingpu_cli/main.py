@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import http.client
 import json
+import logging
 import os
 import posixpath
 import shlex
@@ -17,12 +19,15 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 from importlib import resources as importlib_resources
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+from . import broker_client
 
 
 BRIDGE_DIR = Path(__file__).resolve().parents[3]
@@ -89,6 +94,22 @@ class GatewayConfig:
     request_timeout_seconds: int = 1800
     client_read_timeout_seconds: int = 60
     restart_mode: str = "on_demand"
+
+
+@dataclass(slots=True)
+class BrokerConfig:
+    # Shared GPU lease arbiter on the WSL host (wsl/gpu_broker.py). When enabled,
+    # wingpu acquires the GPU (evicting any other bridge that holds it and waiting
+    # for VRAM to drain) before starting llama, and releases it on offload/stop.
+    enabled: bool = True
+    runtime_id: str = "llama"        # this bridge's identity to the broker
+    remote_dir: str = ""             # empty -> runtime_defaults.remote_state_dir
+    vram_floor_mb: int = 2000        # VRAM (MB) at/below which the card counts as freed
+    free_timeout_seconds: int = 60   # max wait for VRAM to drain after an eviction
+    acquire_wait_seconds: int = 30   # wait for a busy holder to go idle before failing
+    busy_util_pct: int = 15          # GPU util%% considered busy
+    watchdog_idle_timeout_seconds: int = 900
+    watchdog_poll_seconds: int = 15
 
 
 @dataclass(slots=True)
@@ -173,6 +194,7 @@ class Settings:
     catalog_file: str = "package://wingpu_cli.resources/qwen_gguf_catalog.json"
     defaults_file: str = "package://wingpu_cli.resources/wingpu.defaults.toml"
     active_config_file: str | None = None
+    broker: BrokerConfig = field(default_factory=BrokerConfig)
 
     @property
     def backend_tunnel_socket(self) -> Path:
@@ -336,7 +358,7 @@ def load_settings(host: str | None = None, distro: str | None = None, api_key: s
     with local_config.open("rb") as handle:
         config = merge_dicts(config, tomllib.load(handle))
 
-    env_overrides: dict[str, Any] = {"connection": {}, "gateway": {}, "runtime_defaults": {}, "paths": {}}
+    env_overrides: dict[str, Any] = {"connection": {}, "gateway": {}, "runtime_defaults": {}, "paths": {}, "broker": {}}
     if os.getenv("WINGPU_HOST"):
         env_overrides["connection"]["host"] = os.environ["WINGPU_HOST"]
     if os.getenv("WINGPU_DISTRO"):
@@ -381,6 +403,8 @@ def load_settings(host: str | None = None, distro: str | None = None, api_key: s
         env_overrides["paths"]["remote_src_root"] = os.environ["WINGPU_REMOTE_SRC_ROOT"]
     if os.getenv("WINGPU_REMOTE_MODELS_ROOT"):
         env_overrides["paths"]["remote_models_root"] = os.environ["WINGPU_REMOTE_MODELS_ROOT"]
+    if os.getenv("WINGPU_BROKER_ENABLED"):
+        env_overrides["broker"]["enabled"] = os.environ["WINGPU_BROKER_ENABLED"].lower() in {"1", "true", "yes", "on"}
     config = merge_dicts(config, env_overrides)
 
     if host:
@@ -427,6 +451,7 @@ def load_settings(host: str | None = None, distro: str | None = None, api_key: s
         catalog_file=config_source_label("qwen_gguf_catalog.json"),
         defaults_file=config_source_label("wingpu.defaults.toml"),
         active_config_file=str(local_config) if local_config is not None else None,
+        broker=BrokerConfig(**config.get("broker", {})),
     )
 
 
@@ -612,6 +637,24 @@ def shutil_which(name: str) -> str | None:
     from shutil import which
 
     return which(name)
+
+
+@contextmanager
+def cli_lock(settings: Settings):
+    """Prevent concurrent wingpu CLI operations via file lock."""
+    lock_path = settings.state.state_dir / "wingpu.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = lock_path.open("w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fd.close()
+        raise WingpuError("Another wingpu operation is already in progress.")
+    try:
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
 
 
 def run(
@@ -811,8 +854,13 @@ def ensure_backend_tunnel(settings: Settings) -> None:
         settings.connection.host,
     ]
     run(start_cmd, timeout=settings.connection.ssh_connect_timeout + 10)
-    time.sleep(1)
-    if run(check_cmd, check=False, timeout=settings.connection.ssh_connect_timeout + 5).returncode != 0:
+    # Poll for tunnel readiness instead of fixed sleep.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if run(check_cmd, check=False, timeout=settings.connection.ssh_connect_timeout + 5).returncode == 0:
+            break
+        time.sleep(0.5)
+    else:
         tunnel_log = settings.backend_tunnel_log_file.read_text(encoding="utf-8", errors="ignore")
         raise WingpuError(f"Failed to establish managed backend SSH tunnel.\n{tunnel_log}")
     pid = port_listener_pid(settings.gateway.backend_local_port)
@@ -934,7 +982,8 @@ printf '{{"running":false,"pid":null,"log_file":"%s","cmd":""}}\\n' "$LOG_FILE"
     result = run_wsl_script(settings, script, check=False, timeout=20)
     try:
         return json.loads((result.stdout or "").strip().splitlines()[-1])
-    except Exception:
+    except Exception as exc:
+        logging.getLogger(__name__).debug("runtime_process_info parse failed: %s", exc)
         return {"running": False, "pid": None, "log_file": log_file, "cmd": ""}
 
 
@@ -979,6 +1028,103 @@ def backend_ready_for_fast_path(settings: Settings, runtime_id: str) -> bool:
     return True
 
 
+def broker_remote_dir(settings: Settings) -> str:
+    configured = (settings.broker.remote_dir or "").strip()
+    if configured:
+        return resolve_remote_path(settings, configured)
+    return remote_runtime_base_dir(settings)
+
+
+def broker_runner(settings: Settings):
+    """Adapter: run a remote bash snippet, return (returncode, stdout) for broker_client."""
+    def _runner(script: str, *, timeout: float | None = None) -> tuple[int, str]:
+        cp = run_wsl_script(settings, script, check=False, timeout=timeout)
+        return cp.returncode, (cp.stdout or "")
+    return _runner
+
+
+def broker_script_bytes() -> bytes:
+    try:
+        return importlib_resources.files("wingpu_cli.resources").joinpath("gpu_broker.py").read_bytes()
+    except Exception:
+        candidate = BRIDGE_DIR / "wsl" / "gpu_broker.py"
+        if candidate.exists():
+            return candidate.read_bytes()
+    raise WingpuError("Bundled gpu_broker.py not found; reinstall wingpu.")
+
+
+def ensure_broker_installed(settings: Settings) -> None:
+    runner = broker_runner(settings)
+    remote_dir = broker_remote_dir(settings)
+    if broker_client.is_installed(runner, remote_dir):
+        return
+    broker_client.install(runner, remote_dir, broker_script_bytes())
+
+
+def llama_vram_estimate_mb(settings: Settings, model_name: str) -> int | None:
+    try:
+        entry = catalog_entry(settings, model_name)
+    except WingpuError:
+        return None
+    size = entry.get("size_bytes")
+    return int(int(size) / (1024 * 1024)) if size else None
+
+
+def acquire_gpu_lease(settings: Settings, model_name: str, runtime_id: str, *, force: bool = False) -> None:
+    """Acquire the shared GPU before starting llama, evicting any other holder.
+
+    Fails closed only on an explicit "busy" denial (would OOM); on broker errors it
+    warns and proceeds so a broker hiccup never blocks a normal start.
+    """
+    if not settings.broker.enabled:
+        return
+    runner = broker_runner(settings)
+    remote_dir = broker_remote_dir(settings)
+    pidfile = remote_runtime_pid_file(settings, runtime_id)
+    vram = llama_vram_estimate_mb(settings, model_name)
+
+    def _do() -> dict[str, Any] | None:
+        return broker_client.acquire(
+            runner, remote_dir=remote_dir, runtime=settings.broker.runtime_id,
+            pidfile=pidfile, vram_mb=vram, label=f"wingpu:{runtime_id}:{model_name}",
+            wait=settings.broker.acquire_wait_seconds, force=force,
+            busy_util=settings.broker.busy_util_pct, vram_floor=settings.broker.vram_floor_mb,
+            free_timeout=settings.broker.free_timeout_seconds,
+        )
+
+    result = _do()
+    if result is None:
+        # No JSON came back: the broker is probably not installed yet. Install and retry once.
+        try:
+            ensure_broker_installed(settings)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[wingpu] warning: GPU broker unavailable ({exc}); starting without a lease.", file=sys.stderr)
+            return
+        result = _do()
+    if result is None:
+        print("[wingpu] warning: GPU broker did not respond; starting without a lease.", file=sys.stderr)
+        return
+    if not result.get("granted"):
+        holder = result.get("holder")
+        raise WingpuError(
+            f"GPU is held by '{holder}' which is busy; llama was not started. "
+            "Wait for it to finish, stop it, or preempt with: wingpu start --force-gpu"
+        )
+    evicted = result.get("evicted")
+    if evicted:
+        print(f"[wingpu] GPU broker: evicted '{evicted}' to load the llama runtime.")
+
+
+def release_gpu_lease(settings: Settings) -> None:
+    if not settings.broker.enabled:
+        return
+    try:
+        broker_client.release(broker_runner(settings), remote_dir=broker_remote_dir(settings),
+                              runtime=settings.broker.runtime_id)
+    except Exception:  # pylint: disable=broad-except
+        pass
+
+
 def ensure_runtime_loaded(
     settings: Settings,
     model_name: str,
@@ -988,6 +1134,7 @@ def ensure_runtime_loaded(
     flash_attn: bool,
     *,
     force_restart: bool = False,
+    force_gpu: bool = False,
 ) -> None:
     check_command("ssh")
     catalog_entry(settings, model_name)
@@ -1017,6 +1164,7 @@ def ensure_runtime_loaded(
         stop_backend_tunnel(settings)
         ensure_backend_tunnel(settings)
 
+    acquire_gpu_lease(settings, model_name, runtime_id, force=force_gpu)
     start_remote_runtime(settings, runtime_id, model_name, cache_type_k, cache_type_v, flash_attn)
     wait_for_backend_api(settings, runtime_id, model_name, cache_type_k, cache_type_v)
 
@@ -1065,34 +1213,36 @@ def gateway_is_running(settings: Settings) -> bool:
 
 def ensure_gateway_started(settings: Settings) -> None:
     settings.state.state_dir.mkdir(parents=True, exist_ok=True)
-    status = gateway_status(settings)
-    if status and status.get("gateway_up"):
-        return
-    if local_port_in_use(settings.connection.local_port):
-        raise WingpuError(
-            f"Gateway port {settings.connection.local_port} is already in use by another process."
-        )
-    log_handle = settings.state.gateway_log_path.open("a", encoding="utf-8")
-    env = os.environ.copy()
-    bridge_dir = discover_bridge_dir()
-    if bridge_dir is not None:
-        env["WINGPU_PROJECT_DIR"] = str(bridge_dir)
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "wingpu_cli", "__gateway_serve"],
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        env=env,
-    )
-    settings.state.gateway_pid_path.write_text(f"{proc.pid}\n", encoding="utf-8")
-    deadline = time.time() + 15
-    while time.time() < deadline:
+    with cli_lock(settings):
         status = gateway_status(settings)
         if status and status.get("gateway_up"):
             return
-        time.sleep(0.5)
-    log_text = settings.state.gateway_log_path.read_text(encoding="utf-8", errors="ignore")
-    raise WingpuError(f"Gateway did not become ready in time.\n{log_text}")
+        if local_port_in_use(settings.connection.local_port):
+            raise WingpuError(
+                f"Gateway port {settings.connection.local_port} is already in use by another process."
+            )
+        log_handle = settings.state.gateway_log_path.open("a", encoding="utf-8")
+        env = os.environ.copy()
+        bridge_dir = discover_bridge_dir()
+        if bridge_dir is not None:
+            env["WINGPU_PROJECT_DIR"] = str(bridge_dir)
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "wingpu_cli", "__gateway_serve"],
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+        log_handle.close()
+        settings.state.gateway_pid_path.write_text(f"{proc.pid}\n", encoding="utf-8")
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            status = gateway_status(settings)
+            if status and status.get("gateway_up"):
+                return
+            time.sleep(0.5)
+        log_text = settings.state.gateway_log_path.read_text(encoding="utf-8", errors="ignore")
+        raise WingpuError(f"Gateway did not become ready in time.\n{log_text}")
 
 
 def stop_gateway(settings: Settings) -> None:
@@ -1132,6 +1282,8 @@ def gateway_offload(settings: Settings) -> dict[str, Any]:
 
 
 class GatewayCoordinator:
+    # Lock ordering: start_lock must always be acquired before state_lock.
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.state_lock = threading.RLock()
@@ -1245,6 +1397,7 @@ class GatewayCoordinator:
                     raise WingpuError("Cannot offload while requests are active.")
             stop_remote_runtime(self.settings)
             stop_backend_tunnel(self.settings)
+            release_gpu_lease(self.settings)
             with self.state_lock:
                 self.runtime_loaded = False
                 self.last_offload_at = time.time()
@@ -1255,28 +1408,31 @@ class GatewayCoordinator:
     def maybe_idle_offload(self) -> None:
         if not self.settings.gateway.idle_offload_enabled:
             return
-        with self.state_lock:
-            if self.active_requests > 0 or not self.runtime_loaded:
-                return
-            last_activity = self.last_request_finished_at or self.last_runtime_start_at
-            if last_activity is None:
-                return
-            if time.time() - last_activity < self.settings.gateway.idle_timeout_seconds:
-                return
-        if self.start_lock.acquire(blocking=False):
-            try:
-                with self.state_lock:
-                    if self.active_requests > 0 or not self.runtime_loaded:
-                        return
-                stop_remote_runtime(self.settings)
-                stop_backend_tunnel(self.settings)
-                with self.state_lock:
-                    self.runtime_loaded = False
-                    self.last_offload_at = time.time()
-                    self.idle_status = "runtime_offloaded:idle"
-                    self.write_state()
-            finally:
-                self.start_lock.release()
+        if not self.start_lock.acquire(blocking=False):
+            return
+        try:
+            with self.state_lock:
+                if self.active_requests > 0 or not self.runtime_loaded:
+                    return
+                last_activity = self.last_request_finished_at or self.last_runtime_start_at
+                if last_activity is None:
+                    return
+                if time.time() - last_activity < self.settings.gateway.idle_timeout_seconds:
+                    return
+            # Re-check after releasing state_lock — double-check pattern.
+            with self.state_lock:
+                if self.active_requests > 0 or not self.runtime_loaded:
+                    return
+            stop_remote_runtime(self.settings)
+            stop_backend_tunnel(self.settings)
+            release_gpu_lease(self.settings)
+            with self.state_lock:
+                self.runtime_loaded = False
+                self.last_offload_at = time.time()
+                self.idle_status = "runtime_offloaded:idle"
+                self.write_state()
+        finally:
+            self.start_lock.release()
 
     def idle_loop(self) -> None:
         while not self.stop_event.wait(self.settings.gateway.idle_poll_seconds):
@@ -1470,44 +1626,54 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             timeout=self.coordinator.settings.gateway.request_timeout_seconds,
         )
         try:
-            conn.connect()
-        except Exception as exc:
-            raise ProxyAttemptError("connect", exc) from exc
-        try:
-            conn.request(self.command, self.path, body=body, headers=headers)
-        except Exception as exc:
-            raise ProxyAttemptError("send_request", exc) from exc
-        try:
-            resp = conn.getresponse()
-        except Exception as exc:
-            raise ProxyAttemptError("await_response", exc) from exc
-        self.send_response(resp.status, resp.reason)
-        for key, value in resp.getheaders():
-            if key.lower() in {
-                "connection",
-                "proxy-connection",
-                "keep-alive",
-                "transfer-encoding",
-                "upgrade",
-                "proxy-authenticate",
-                "proxy-authorization",
-                "te",
-                "trailer",
-            }:
-                continue
-            self.send_header(key, value)
-        self.send_header("Connection", "close")
-        self.end_headers()
-        try:
-            while True:
-                chunk = resp.read(64 * 1024)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except Exception as exc:
-            raise ProxyAttemptError("stream_response", exc) from exc
-        self.close_connection = True
+            try:
+                conn.connect()
+            except Exception as exc:
+                raise ProxyAttemptError("connect", exc) from exc
+            try:
+                conn.request(self.command, self.path, body=body, headers=headers)
+            except Exception as exc:
+                raise ProxyAttemptError("send_request", exc) from exc
+            try:
+                resp = conn.getresponse()
+            except Exception as exc:
+                raise ProxyAttemptError("await_response", exc) from exc
+            self.send_response(resp.status, resp.reason)
+            for key, value in resp.getheaders():
+                if key.lower() in {
+                    "connection",
+                    "proxy-connection",
+                    "keep-alive",
+                    "transfer-encoding",
+                    "upgrade",
+                    "proxy-authenticate",
+                    "proxy-authorization",
+                    "te",
+                    "trailer",
+                }:
+                    continue
+                self.send_header(key, value)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except Exception as exc:
+                raise ProxyAttemptError("stream_response", exc) from exc
+            self.close_connection = True
+        finally:
+            # Always close the backend connection. Critical when the client
+            # disconnects mid-stream: closing tears down the TCP socket to
+            # llama-server, which causes it to abort the generation and free
+            # the GPU instead of continuing to produce tokens for nobody.
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _proxy(self) -> None:
         self.coordinator.begin_request()
@@ -1652,6 +1818,29 @@ def print_status(settings: Settings) -> None:
         print(info.get("cmd", ""))
     else:
         print("No native runtime process is running.")
+    print()
+
+    print("== GPU broker ==")
+    if not settings.broker.enabled:
+        print("Broker: disabled (broker.enabled = false)")
+    else:
+        try:
+            data = broker_client.status(broker_runner(settings), remote_dir=broker_remote_dir(settings))
+        except Exception:  # pylint: disable=broad-except
+            data = None
+        if data is None:
+            print("Broker: unreachable or not installed (wingpu broker install)")
+        else:
+            holder = data.get("holder")
+            gpu = data.get("gpu") or {}
+            wd = data.get("watchdog") or {}
+            if holder:
+                print(f"Holder:   {holder.get('runtime_id')} (busy={holder.get('busy')}, alive={holder.get('alive')})")
+            else:
+                print("Holder:   none (GPU is free)")
+            if gpu.get("mem_used_mb") is not None:
+                print(f"VRAM:     {gpu.get('mem_used_mb')}/{gpu.get('mem_total_mb')} MB used, util {gpu.get('util_pct')}%")
+            print(f"Watchdog: {'running' if wd.get('running') else 'stopped'}")
 
 
 def print_models(settings: Settings) -> None:
@@ -1917,6 +2106,7 @@ def start(
     explicit_cache_type_k: str | None = None,
     explicit_cache_type_v: str | None = None,
     flash_attn: bool | None = None,
+    force_gpu: bool = False,
 ) -> None:
     model_name = explicit_model or selected_model(settings)
     runtime_id = explicit_runtime or selected_runtime(settings)
@@ -1932,6 +2122,7 @@ def start(
         cache_type_v,
         flash_attn,
         force_restart=True,
+        force_gpu=force_gpu,
     )
 
 
@@ -1939,6 +2130,7 @@ def stop(settings: Settings) -> None:
     stop_gateway(settings)
     stop_backend_tunnel(settings)
     stop_remote_runtime(settings)
+    release_gpu_lease(settings)
 
 
 def restart(
@@ -1948,6 +2140,7 @@ def restart(
     explicit_cache_type_k: str | None = None,
     explicit_cache_type_v: str | None = None,
     flash_attn: bool | None = None,
+    force_gpu: bool = False,
 ) -> None:
     stop(settings)
     start(
@@ -1957,7 +2150,33 @@ def restart(
         explicit_cache_type_k=explicit_cache_type_k,
         explicit_cache_type_v=explicit_cache_type_v,
         flash_attn=flash_attn,
+        force_gpu=force_gpu,
     )
+
+
+def cmd_broker_status(settings: Settings, *, as_json: bool = False) -> None:
+    data = broker_client.status(broker_runner(settings), remote_dir=broker_remote_dir(settings))
+    if data is None:
+        print("Broker: unreachable or not installed (run: wingpu broker install)")
+        return
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+    holder = data.get("holder")
+    gpu = data.get("gpu") or {}
+    wd = data.get("watchdog") or {}
+    print(f"broker dir : {data.get('broker_dir')}")
+    if holder:
+        print(f"holder     : {holder.get('runtime_id')} "
+              f"(pid={holder.get('pid')}, alive={holder.get('alive')}, busy={holder.get('busy')})")
+        print(f"  since    : {holder.get('acquired_at')}")
+    else:
+        print("holder     : (none) — GPU is free")
+    if gpu.get("mem_used_mb") is not None:
+        print(f"gpu vram   : {gpu.get('mem_used_mb')} / {gpu.get('mem_total_mb')} MB used, util {gpu.get('util_pct')}%")
+    else:
+        print("gpu vram   : (nvidia-smi unavailable)")
+    print(f"watchdog   : {'running pid ' + str(wd.get('pid')) if wd.get('running') else 'stopped'}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1976,6 +2195,8 @@ def build_parser() -> argparse.ArgumentParser:
     flash_group = start_parser.add_mutually_exclusive_group()
     flash_group.add_argument("--flash-attn", dest="flash_attn", action="store_true", help="Force flash attention on")
     flash_group.add_argument("--no-flash-attn", dest="flash_attn", action="store_false", help="Force flash attention off")
+    start_parser.add_argument("--force-gpu", dest="force_gpu", action="store_true",
+                              help="Preempt the GPU even if another bridge is mid-request")
     start_parser.set_defaults(flash_attn=None)
 
     restart_parser = subparsers.add_parser("restart", help="Restart the gateway, backend tunnel, and remote llama.cpp runtime")
@@ -1986,6 +2207,8 @@ def build_parser() -> argparse.ArgumentParser:
     restart_flash_group = restart_parser.add_mutually_exclusive_group()
     restart_flash_group.add_argument("--flash-attn", dest="flash_attn", action="store_true", help="Force flash attention on")
     restart_flash_group.add_argument("--no-flash-attn", dest="flash_attn", action="store_false", help="Force flash attention off")
+    restart_parser.add_argument("--force-gpu", dest="force_gpu", action="store_true",
+                                help="Preempt the GPU even if another bridge is mid-request")
     restart_parser.set_defaults(flash_attn=None)
 
     subparsers.add_parser("stop", help="Stop the gateway, backend tunnel, and remote llama.cpp runtime")
@@ -2065,6 +2288,19 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--force", action="store_true", help="Overwrite existing config")
     init_parser.add_argument("--global", dest="global_config", action="store_true", help="Write the central user config")
 
+    broker_parser = subparsers.add_parser("broker", help="Manage the shared GPU lease broker on the WSL host")
+    broker_subparsers = broker_parser.add_subparsers(dest="broker_command", required=True)
+    broker_status_parser = broker_subparsers.add_parser("status", help="Show GPU holder, VRAM, and watchdog status")
+    broker_status_parser.add_argument("--json", action="store_true", help="Emit raw JSON")
+    broker_subparsers.add_parser("install", help="Upload/refresh gpu_broker.py on the WSL host")
+    broker_evict_parser = broker_subparsers.add_parser("evict", help="Evict the current GPU holder")
+    broker_evict_parser.add_argument("--runtime", default=None, help="Only evict if this runtime holds the GPU")
+    broker_watchdog_parser = broker_subparsers.add_parser("watchdog", help="Manage the idle-eviction watchdog")
+    broker_watchdog_subparsers = broker_watchdog_parser.add_subparsers(dest="watchdog_command", required=True)
+    broker_watchdog_subparsers.add_parser("start", help="Start the watchdog (idle offload across all bridges)")
+    broker_watchdog_subparsers.add_parser("stop", help="Stop the watchdog")
+    broker_watchdog_subparsers.add_parser("status", help="Show broker + watchdog status")
+
     internal_gateway = subparsers.add_parser("__gateway_serve", help=argparse.SUPPRESS)
     internal_gateway.set_defaults(internal_gateway=True)
 
@@ -2098,6 +2334,7 @@ def main(argv: list[str] | None = None) -> int:
                 explicit_cache_type_k=args.cache_type_k,
                 explicit_cache_type_v=args.cache_type_v,
                 flash_attn=args.flash_attn,
+                force_gpu=args.force_gpu,
             )
         elif args.command == "restart":
             restart(
@@ -2107,6 +2344,7 @@ def main(argv: list[str] | None = None) -> int:
                 explicit_cache_type_k=args.cache_type_k,
                 explicit_cache_type_v=args.cache_type_v,
                 flash_attn=args.flash_attn,
+                force_gpu=args.force_gpu,
             )
         elif args.command == "stop":
             stop(settings)
@@ -2196,6 +2434,32 @@ def main(argv: list[str] | None = None) -> int:
                 runtime_id = args.runtime_id or selected_runtime(settings)
                 lane = runtime_lane(settings, runtime_id)
                 run_admin_wrapper(settings, "wingpu-install-llamacpp-system", f"{lane.build_dir}/bin")
+        elif args.command == "broker":
+            if args.broker_command == "status":
+                cmd_broker_status(settings, as_json=args.json)
+            elif args.broker_command == "install":
+                # Always refresh (unlike the lazy ensure_broker_installed used on acquire).
+                broker_client.install(broker_runner(settings), broker_remote_dir(settings), broker_script_bytes())
+                print(f"GPU broker installed at {broker_remote_dir(settings)} on {settings.connection.host}.")
+            elif args.broker_command == "evict":
+                data = broker_client.evict(broker_runner(settings),
+                                           remote_dir=broker_remote_dir(settings), runtime=args.runtime)
+                print(json.dumps(data, indent=2) if data else "broker: no response (try: wingpu broker install)")
+            elif args.broker_command == "watchdog":
+                runner = broker_runner(settings)
+                remote_dir = broker_remote_dir(settings)
+                if args.watchdog_command == "start":
+                    ensure_broker_installed(settings)
+                    _rc, out = broker_client.watchdog_start(
+                        runner, remote_dir=remote_dir,
+                        idle_timeout=settings.broker.watchdog_idle_timeout_seconds,
+                        poll=settings.broker.watchdog_poll_seconds, busy_util=settings.broker.busy_util_pct)
+                    print(out.strip() or "watchdog start issued")
+                elif args.watchdog_command == "stop":
+                    _rc, out = broker_client.watchdog_stop(runner, remote_dir=remote_dir)
+                    print(out.strip() or "watchdog stop issued")
+                else:
+                    cmd_broker_status(settings, as_json=False)
         elif args.command == "config":
             if args.config_command == "show":
                 print_config_show(settings)
