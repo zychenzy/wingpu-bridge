@@ -276,7 +276,7 @@ Expected outcome:
 wingpu benchmark run
 ```
 
-## 7. the app Contract
+## 7. Client Contract
 
 `the app` should point to:
 
