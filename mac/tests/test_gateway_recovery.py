@@ -1,6 +1,7 @@
 import http.client
 import io
 import json
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -366,12 +367,17 @@ gateway_lock_file = "gateway.lock"
         self.assertEqual(remote_runtime_pid_file(settings, "turboquant-cuda"), "/home/czy/.gpu-bridge/run/turboquant-cuda.pid")
         self.assertEqual(remote_runtime_log_file(settings, "turboquant-cuda"), "/home/czy/.gpu-bridge/logs/turboquant-cuda.log")
 
-    def test_backend_tunnel_auto_target_uses_wsl_guest_ip(self):
+    def test_backend_relay_uses_ssh_stdio_to_wsl_nc_not_nat_forward(self):
+        # The relay must carry bytes over the ssh channel to a WSL-local nc, never an
+        # `ssh -L` forward into the WSL NAT IP (that path drops long connections at ~15s).
         settings = make_settings()
-        with mock.patch.object(main, "run", return_value=mock.Mock(stdout="172.18.59.242 172.17.0.1\n")) as run:
-            self.assertEqual(main.backend_tunnel_target_host(settings), "172.18.59.242")
-
-        self.assertIn("hostname", run.call_args.args[0])
+        cmd = main._relay_backend_command(settings)
+        self.assertEqual(cmd[0], "ssh")
+        self.assertEqual(cmd[-2], settings.connection.host)
+        self.assertIn(f"nc 127.0.0.1 {settings.connection.remote_port}", cmd[-1])
+        self.assertIn("wsl", cmd[-1])
+        self.assertNotIn("-L", cmd)  # not a TCP port-forward
+        self.assertIn("ControlMaster=auto", cmd)  # multiplexed for cheap per-request ssh
 
     def test_config_global_path_does_not_require_loaded_settings(self):
         target = main.Path("/tmp/wingpu/wingpu.local.toml")
@@ -700,6 +706,38 @@ gateway_lock_file = "gateway.lock"
         self.assertEqual(coordinator.ensure_calls, 0)
         self.assertEqual(sent["status"][0][0], 404)
         self.assertIn(b'"not_found_error"', handler.wfile.getvalue())
+
+    def test_stale_gateway_self_shuts_down_and_does_not_offload(self):
+        # A gateway whose pid no longer owns the pidfile must NOT offload (SIGTERM llama)
+        # and must shut itself down, so duplicate gateways cannot fight over the GPU.
+        settings = make_settings()
+        settings.state.state_dir.mkdir(parents=True, exist_ok=True)
+        settings.state.gateway_pid_path.write_text("999999\n", encoding="utf-8")
+        with mock.patch.object(main, "runtime_process_info", return_value={"running": True}):
+            coord = main.GatewayCoordinator(settings)
+        coord.runtime_loaded = True
+        coord.last_request_finished_at = 1.0  # ancient -> would look idle if it were active
+        coord.server = mock.Mock()
+        with mock.patch.object(main, "stop_remote_runtime") as stop_rt:
+            coord.maybe_idle_offload()
+        stop_rt.assert_not_called()
+        self.assertTrue(coord.stop_event.is_set())
+
+    def test_active_gateway_may_offload_when_idle(self):
+        settings = make_settings()
+        settings.state.state_dir.mkdir(parents=True, exist_ok=True)
+        settings.state.gateway_pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        with mock.patch.object(main, "runtime_process_info", return_value={"running": True}):
+            coord = main.GatewayCoordinator(settings)
+        coord.runtime_loaded = True
+        coord.last_request_finished_at = 1.0  # ancient -> idle
+        with mock.patch.object(main, "stop_remote_runtime") as stop_rt, \
+             mock.patch.object(main, "stop_backend_tunnel"), \
+             mock.patch.object(main, "release_gpu_lease"), \
+             mock.patch.object(coord, "write_state"):
+            coord.maybe_idle_offload()
+        stop_rt.assert_called_once()
+        self.assertFalse(coord.stop_event.is_set())
 
 
 def make_settings():

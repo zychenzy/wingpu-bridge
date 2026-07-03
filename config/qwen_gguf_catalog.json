@@ -16,7 +16,7 @@
     },
     "Qwen3.6-27B-UD-IQ2_M": {
       "gguf_relpath": "Qwen3.6-27B-GGUF/Qwen3.6-27B-UD-IQ2_M.gguf",
-      "context_length": 131072,
+      "context_length": 32768,
       "enabled": true,
       "notes": "27B UD IQ2_M variant for testing lower-VRAM long-context behavior on TurboQuant."
     },
@@ -34,7 +34,7 @@
     },
     "Qwen3.6-27B-MTP-UD-IQ2_M": {
       "gguf_relpath": "Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-IQ2_M.gguf",
-      "context_length": 131072,
+      "context_length": 32768,
       "enabled": true,
       "notes": "27B MTP UD IQ2_M variant selected as the main 16 GiB long-context MTP candidate."
     },

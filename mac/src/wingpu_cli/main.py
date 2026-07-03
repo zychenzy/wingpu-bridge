@@ -813,70 +813,211 @@ def wsl_guest_ip(settings: Settings) -> str:
     raise WingpuError(f"Unable to determine WSL IP address for distro {settings.connection.distro}.")
 
 
-def backend_tunnel_target_host(settings: Settings) -> str:
-    configured = settings.gateway.backend_tunnel_target_host
-    if configured.lower() in {"auto", "wsl", "wsl-ip"}:
-        return wsl_guest_ip(settings)
-    return configured
+def _relay_backend_command(settings: Settings) -> list[str]:
+    """The per-connection ssh command the relay spawns.
+
+    Carries the backend byte stream over the ssh channel to a WSL-local `nc`, so the
+    connection terminates inside WSL (no Hyper-V NAT hop that dies at ~15s). ssh is
+    multiplexed over one persistent ControlMaster so each request is cheap.
+    """
+    remote_command = (
+        f"wsl -d {shlex.quote(settings.connection.distro)} -- "
+        f"nc 127.0.0.1 {settings.connection.remote_port}"
+    )
+    return [
+        "ssh",
+        *ssh_options(settings),
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={settings.backend_tunnel_socket}",
+        "-o", "ControlPersist=300",
+        settings.connection.host,
+        remote_command,
+    ]
+
+
+def serve_relay(settings: Settings) -> None:
+    """Backend transport: an ssh-stdio relay, NOT an `ssh -L` TCP forward.
+
+    On this host, TCP connections *into* the WSL VM over the Hyper-V NAT are killed
+    after ~15s even while fully active, which severs long generations mid-stream. The
+    plain ssh channel is stable, so we carry backend HTTP over ssh to a WSL-local `nc`
+    (see _relay_backend_command): no NAT hop, no 15s cap.
+    """
+    host = settings.gateway.backend_host
+    port = settings.gateway.backend_local_port
+    control_path = str(settings.backend_tunnel_socket)
+    per_conn_ssh = _relay_backend_command(settings)
+
+    def _handle(client: socket.socket) -> None:
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            proc = subprocess.Popen(
+                per_conn_ssh,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+        except Exception:  # pylint: disable=broad-except
+            client.close()
+            return
+        in_fd, out_fd = proc.stdin.fileno(), proc.stdout.fileno()
+
+        def _client_to_backend() -> None:
+            try:
+                while True:
+                    data = client.recv(65536)
+                    if not data:
+                        break
+                    os.write(in_fd, data)
+            except OSError:
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+        pump = threading.Thread(target=_client_to_backend, daemon=True)
+        pump.start()
+        try:
+            while True:
+                chunk = os.read(out_fd, 65536)
+                if not chunk:
+                    break
+                client.sendall(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            client.close()
+            if proc.poll() is None:
+                proc.terminate()
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((host, port))
+    listener.listen(128)
+    settings.backend_tunnel_pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    # Pre-establish the ssh ControlMaster so per-connection ssh multiplexes over it
+    # instantly, instead of each racing to create it (which caused sporadic connect
+    # failures that made the gateway think the model had gone away).
+    run(
+        [
+            "ssh", *ssh_options(settings),
+            "-M", "-N", "-f",
+            "-o", f"ControlPath={control_path}",
+            "-o", "ControlPersist=300",
+            settings.connection.host,
+        ],
+        check=False,
+        timeout=settings.connection.ssh_connect_timeout + 10,
+    )
+
+    def _handle_signal(signum: int, frame: Any) -> None:
+        try:
+            listener.close()
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    try:
+        while True:
+            try:
+                client, _addr = listener.accept()
+            except OSError:
+                break
+            threading.Thread(target=_handle, args=(client,), daemon=True).start()
+    finally:
+        settings.backend_tunnel_pid_file.unlink(missing_ok=True)
+        run(
+            ["ssh", *ssh_options(settings), "-S", control_path, "-O", "exit", settings.connection.host],
+            check=False,
+            timeout=settings.connection.ssh_connect_timeout + 5,
+        )
+
+
+def backend_relay_running(settings: Settings) -> bool:
+    pid_path = settings.backend_tunnel_pid_file
+    if not pid_path.exists():
+        return False
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return local_port_in_use(settings.gateway.backend_local_port)
 
 
 def ensure_backend_tunnel(settings: Settings) -> None:
-    target_host = backend_tunnel_target_host(settings)
+    """Ensure the backend relay (see serve_relay) is listening on the local port."""
     print(
-        f"[3/4] Ensuring backend SSH tunnel localhost:{settings.gateway.backend_local_port} -> "
-        f"{settings.connection.host}:{target_host}:{settings.connection.remote_port} ..."
+        f"[3/4] Ensuring backend relay localhost:{settings.gateway.backend_local_port} -> "
+        f"{settings.connection.host}:wsl:{settings.connection.remote_port} (ssh-stdio, no NAT) ..."
     )
-    settings.state.state_dir.mkdir(parents=True, exist_ok=True)
-    sock = str(settings.backend_tunnel_socket)
-    check_cmd = ["ssh", *ssh_options(settings), "-S", sock, "-O", "check", settings.connection.host]
-    if run(check_cmd, check=False, timeout=settings.connection.ssh_connect_timeout + 5).returncode == 0:
-        print("Managed backend tunnel already running.")
+    if backend_relay_running(settings):
+        print("Managed backend relay already running.")
         return
-
-    settings.backend_tunnel_socket.unlink(missing_ok=True)
+    # Clear any stale relay pidfile / control socket left by a dead relay.
     settings.backend_tunnel_pid_file.unlink(missing_ok=True)
+    settings.backend_tunnel_socket.unlink(missing_ok=True)
     if local_port_in_use(settings.gateway.backend_local_port):
-        raise WingpuError(f"Local backend port {settings.gateway.backend_local_port} is already in use by another process.")
-
-    start_cmd = [
-        "ssh",
-        "-fN",
-        "-M",
-        "-S",
-        sock,
-        *ssh_options(settings),
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-E",
-        str(settings.backend_tunnel_log_file),
-        "-L",
-        f"{settings.gateway.backend_local_port}:{target_host}:{settings.connection.remote_port}",
-        settings.connection.host,
-    ]
-    run(start_cmd, timeout=settings.connection.ssh_connect_timeout + 10)
-    # Poll for tunnel readiness instead of fixed sleep.
-    deadline = time.time() + 5
+        raise WingpuError(
+            f"Local backend port {settings.gateway.backend_local_port} is already in use by another process."
+        )
+    settings.state.state_dir.mkdir(parents=True, exist_ok=True)
+    log_handle = settings.backend_tunnel_log_file.open("a", encoding="utf-8")
+    env = os.environ.copy()
+    bridge_dir = discover_bridge_dir()
+    if bridge_dir is not None:
+        env["WINGPU_PROJECT_DIR"] = str(bridge_dir)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "wingpu_cli", "__relay_serve"],
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=env,
+    )
+    log_handle.close()
+    settings.backend_tunnel_pid_file.write_text(f"{proc.pid}\n", encoding="utf-8")
+    deadline = time.time() + 10
     while time.time() < deadline:
-        if run(check_cmd, check=False, timeout=settings.connection.ssh_connect_timeout + 5).returncode == 0:
+        if local_port_in_use(settings.gateway.backend_local_port):
+            return
+        if proc.poll() is not None:
             break
-        time.sleep(0.5)
-    else:
-        tunnel_log = settings.backend_tunnel_log_file.read_text(encoding="utf-8", errors="ignore")
-        raise WingpuError(f"Failed to establish managed backend SSH tunnel.\n{tunnel_log}")
-    pid = port_listener_pid(settings.gateway.backend_local_port)
-    if pid:
-        settings.backend_tunnel_pid_file.write_text(f"{pid}\n", encoding="utf-8")
+        time.sleep(0.2)
+    detail = settings.backend_tunnel_log_file.read_text(encoding="utf-8", errors="ignore")[-2000:]
+    raise WingpuError(
+        f"Backend relay did not start listening on port {settings.gateway.backend_local_port}.\n{detail}"
+    )
 
 
 def stop_backend_tunnel(settings: Settings) -> None:
-    print("[1/2] Stopping backend SSH tunnel...")
+    print("[1/2] Stopping backend relay...")
+    pid_path = settings.backend_tunnel_pid_file
+    if pid_path.exists():
+        try:
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+            os.kill(pid, signal.SIGTERM)
+        except (ValueError, OSError):
+            pass
+        pid_path.unlink(missing_ok=True)
     run(
         ["ssh", *ssh_options(settings), "-S", str(settings.backend_tunnel_socket), "-O", "exit", settings.connection.host],
         check=False,
         timeout=settings.connection.ssh_connect_timeout + 5,
     )
     settings.backend_tunnel_socket.unlink(missing_ok=True)
-    settings.backend_tunnel_pid_file.unlink(missing_ok=True)
 
 
 def stop_remote_runtime(settings: Settings) -> None:
@@ -1021,11 +1162,16 @@ def backend_ready_for_fast_path(settings: Settings, runtime_id: str) -> bool:
     process = runtime_process_info(settings, runtime_id)
     if not process.get("running"):
         return False
-    try:
-        backend_api_json(settings, "/v1/models")
-    except Exception:
-        return False
-    return True
+    # Retry: the relay's first request pays a one-off ControlMaster setup, and a single
+    # transient miss must NOT make the caller kill+restart a perfectly healthy model.
+    for attempt in range(3):
+        try:
+            backend_api_json(settings, "/v1/models")
+            return True
+        except Exception:  # pylint: disable=broad-except
+            if attempt < 2:
+                time.sleep(1.0)
+    return False
 
 
 def broker_remote_dir(settings: Settings) -> str:
@@ -1150,15 +1296,26 @@ def ensure_runtime_loaded(
         stop_remote_runtime(settings)
         stop_backend_tunnel(settings)
 
-    ensure_backend_tunnel(settings)
-    if not force_restart and backend_ready_for_fast_path(settings, runtime_id):
+    def _mark_selected() -> None:
         set_selected_model(settings, model_name)
         set_selected_runtime(settings, runtime_id)
         set_selected_cache_type(settings, "k", cache_type_k, runtime_id)
         set_selected_cache_type(settings, "v", cache_type_v, runtime_id)
+
+    ensure_backend_tunnel(settings)
+    if not force_restart and backend_ready_for_fast_path(settings, runtime_id):
+        _mark_selected()
         return
 
     process = runtime_process_info(settings, runtime_id)
+    if not force_restart and process.get("running"):
+        # The model process is alive but the readiness probe missed. That is almost always
+        # a cold/transient transport, NOT a dead model. Use the live process as-is; never
+        # reload a healthy 27B (~40s) over a probe blip -- that was the restart storm. A
+        # genuinely broken backend surfaces as a proxy error and is recovered there.
+        _mark_selected()
+        return
+
     if process.get("running"):
         stop_remote_runtime(settings)
         stop_backend_tunnel(settings)
@@ -1405,7 +1562,23 @@ class GatewayCoordinator:
                 self.write_state()
             return self.status_payload()
 
+    def _is_active_gateway(self) -> bool:
+        """True only if this process owns the gateway pidfile (i.e. is the live gateway)."""
+        try:
+            pid = int(self.settings.state.gateway_pid_path.read_text(encoding="utf-8").strip())
+        except Exception:
+            return False
+        return pid == os.getpid()
+
     def maybe_idle_offload(self) -> None:
+        if not self._is_active_gateway():
+            # A newer gateway owns the pidfile (or we were stopped). A stale gateway must
+            # never touch the shared runtime: its idle loop would otherwise SIGTERM the live
+            # llama out from under the active gateway. Shut this stale process down instead.
+            self.stop_event.set()
+            if self.server is not None:
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
         if not self.settings.gateway.idle_offload_enabled:
             return
         if not self.start_lock.acquire(blocking=False):
@@ -1785,15 +1958,11 @@ def print_status(settings: Settings) -> None:
     print(f"PID file:     {settings.state.gateway_pid_path if settings.state.gateway_pid_path.exists() else 'missing'}")
     print()
 
-    print("== Backend tunnel ==")
-    if run(
-        ["ssh", *ssh_options(settings), "-S", str(settings.backend_tunnel_socket), "-O", "check", settings.connection.host],
-        check=False,
-        timeout=settings.connection.ssh_connect_timeout + 5,
-    ).returncode == 0:
-        print(f"Managed tunnel: active ({settings.backend_tunnel_socket})")
+    print("== Backend relay ==")
+    if backend_relay_running(settings):
+        print(f"Managed relay: active (ssh-stdio -> wsl:{settings.connection.remote_port})")
     else:
-        print("Managed tunnel: inactive")
+        print("Managed relay: inactive")
     pid_note = "missing"
     if settings.backend_tunnel_pid_file.exists():
         pid = settings.backend_tunnel_pid_file.read_text(encoding="utf-8").strip()
@@ -2304,6 +2473,9 @@ def build_parser() -> argparse.ArgumentParser:
     internal_gateway = subparsers.add_parser("__gateway_serve", help=argparse.SUPPRESS)
     internal_gateway.set_defaults(internal_gateway=True)
 
+    internal_relay = subparsers.add_parser("__relay_serve", help=argparse.SUPPRESS)
+    internal_relay.set_defaults(internal_relay=True)
+
     return parser
 
 
@@ -2326,6 +2498,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "__gateway_serve":
             serve_gateway(settings)
+        elif args.command == "__relay_serve":
+            serve_relay(settings)
         elif args.command == "start":
             start(
                 settings,
