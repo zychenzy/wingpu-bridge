@@ -3,6 +3,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -31,6 +32,7 @@ class DummyCoordinator:
         self.end_calls = 0
         self.ensure_calls = 0
         self.recover_calls = []
+        self.tunnel_refresh_calls = 0
 
     def begin_request(self):
         self.begin_calls += 1
@@ -43,6 +45,9 @@ class DummyCoordinator:
 
     def recover_runtime_after_proxy_error(self, exc):
         self.recover_calls.append(type(exc).__name__)
+
+    def refresh_backend_tunnel(self):
+        self.tunnel_refresh_calls += 1
 
 
 class FakeResponse:
@@ -61,6 +66,72 @@ class FakeResponse:
             return b""
         self._sent = True
         return self.body
+
+    def read1(self, _size=-1):
+        return self.read(_size)
+
+
+class ChunkedFakeResponse:
+    """Mimics an SSE body arriving as separate chunks, as HTTPResponse.read1 would."""
+
+    def __init__(self, chunks, status=200, reason="OK"):
+        self.chunks = list(chunks)
+        self.status = status
+        self.reason = reason
+        self.read_calls = 0
+        self.read1_calls = 0
+
+    def getheaders(self):
+        return [("Content-Type", "text/event-stream")]
+
+    def read(self, _size=-1):
+        # read(amt) on a chunked body coalesces: it blocks until amt bytes or EOF.
+        self.read_calls += 1
+        if not self.chunks:
+            return b""
+        joined = b"".join(self.chunks)
+        self.chunks = []
+        return joined
+
+    def read1(self, _size=-1):
+        self.read1_calls += 1
+        return self.chunks.pop(0) if self.chunks else b""
+
+
+class StreamingHTTPConnection:
+    response = None
+
+    def __init__(self, host, port, timeout=None):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+
+    def connect(self):
+        pass
+
+    def request(self, method, path, body=None, headers=None):
+        pass
+
+    def getresponse(self):
+        return type(self).response
+
+    def close(self):
+        pass
+
+
+class BrokenPipeWriter(io.BytesIO):
+    """A client socket that goes away after the first body write."""
+
+    def __init__(self, fail_after=1):
+        super().__init__()
+        self.fail_after = fail_after
+        self.writes = 0
+
+    def write(self, data):
+        self.writes += 1
+        if self.writes > self.fail_after:
+            raise BrokenPipeError("client went away")
+        return super().write(data)
 
 
 class FlakyHTTPConnection:
@@ -179,7 +250,7 @@ request_timeout_seconds = 1800
 restart_mode = "on_demand"
 
 [runtime_defaults]
-default_runtime = "turboquant-cuda"
+default_runtime = "upstream"
 served_model_name = "qwen-local"
 n_gpu_layers = 99
 threads = 8
@@ -188,19 +259,28 @@ build_jobs = 8
 cuda_architectures = "89"
 flash_attn = true
 remote_state_dir = "~/.gpu-bridge"
-default_cache_type_k = "turbo3_0"
-default_cache_type_v = "turbo3_0"
+default_cache_type_k = "q4_0"
+default_cache_type_v = "q4_0"
 cmake_args = []
 build_targets = ["llama-server", "llama-bench"]
 extra_server_args = []
 
-[runtimes.turboquant-cuda]
+[runtimes.upstream]
 kind = "native"
-source_dir = "/home/czy/src/llama-cpp-turboquant-cuda"
-build_dir = "/home/czy/src/llama-cpp-turboquant-cuda/build-cuda89"
-server_bin = "/home/czy/src/llama-cpp-turboquant-cuda/build-cuda89/bin/llama-server"
-bench_bin = "/home/czy/src/llama-cpp-turboquant-cuda/build-cuda89/bin/llama-bench"
-supported_cache_types = ["turbo3_0"]
+source_dir = "/home/czy/src/llama.cpp"
+build_dir = "/home/czy/src/llama.cpp/build-cuda89"
+server_bin = "/home/czy/src/llama.cpp/build-cuda89/bin/llama-server"
+bench_bin = "/home/czy/src/llama.cpp/build-cuda89/bin/llama-bench"
+supported_cache_types = ["q4_0"]
+
+[runtimes."upstream-mtp"]
+kind = "native"
+source_dir = "/home/czy/src/llama.cpp"
+build_dir = "/home/czy/src/llama.cpp/build-cuda89"
+server_bin = "/home/czy/src/llama.cpp/build-cuda89/bin/llama-server"
+bench_bin = "/home/czy/src/llama.cpp/build-cuda89/bin/llama-bench"
+supported_cache_types = ["q4_0"]
+extra_server_args = ["--spec-type", "draft-mtp"]
 
 [state]
 state_dir = "/tmp/wingpu-tests"
@@ -249,7 +329,7 @@ request_timeout_seconds = 1800
 restart_mode = "on_demand"
 
 [runtime_defaults]
-default_runtime = "turboquant-cuda"
+default_runtime = "upstream"
 served_model_name = "qwen-local"
 n_gpu_layers = 99
 threads = 8
@@ -258,19 +338,28 @@ build_jobs = 8
 cuda_architectures = "89"
 flash_attn = true
 remote_state_dir = "~/.gpu-bridge"
-default_cache_type_k = "turbo3_0"
-default_cache_type_v = "turbo3_0"
+default_cache_type_k = "q4_0"
+default_cache_type_v = "q4_0"
 cmake_args = []
 build_targets = ["llama-server", "llama-bench"]
 extra_server_args = []
 
-[runtimes.turboquant-cuda]
+[runtimes.upstream]
 kind = "native"
-source_dir = "/home/czy/src/llama-cpp-turboquant-cuda"
-build_dir = "/home/czy/src/llama-cpp-turboquant-cuda/build-cuda89"
-server_bin = "/home/czy/src/llama-cpp-turboquant-cuda/build-cuda89/bin/llama-server"
-bench_bin = "/home/czy/src/llama-cpp-turboquant-cuda/build-cuda89/bin/llama-bench"
-supported_cache_types = ["turbo3_0"]
+source_dir = "/home/czy/src/llama.cpp"
+build_dir = "/home/czy/src/llama.cpp/build-cuda89"
+server_bin = "/home/czy/src/llama.cpp/build-cuda89/bin/llama-server"
+bench_bin = "/home/czy/src/llama.cpp/build-cuda89/bin/llama-bench"
+supported_cache_types = ["q4_0"]
+
+[runtimes."upstream-mtp"]
+kind = "native"
+source_dir = "/home/czy/src/llama.cpp"
+build_dir = "/home/czy/src/llama.cpp/build-cuda89"
+server_bin = "/home/czy/src/llama.cpp/build-cuda89/bin/llama-server"
+bench_bin = "/home/czy/src/llama.cpp/build-cuda89/bin/llama-bench"
+supported_cache_types = ["q4_0"]
+extra_server_args = ["--spec-type", "draft-mtp"]
 
 [state]
 state_dir = "/tmp/wingpu-tests"
@@ -364,8 +453,11 @@ gateway_lock_file = "gateway.lock"
         settings = make_settings()
 
         self.assertEqual(remote_runtime_base_dir(settings), "/home/czy/.gpu-bridge")
-        self.assertEqual(remote_runtime_pid_file(settings, "turboquant-cuda"), "/home/czy/.gpu-bridge/run/turboquant-cuda.pid")
-        self.assertEqual(remote_runtime_log_file(settings, "turboquant-cuda"), "/home/czy/.gpu-bridge/logs/turboquant-cuda.log")
+        self.assertEqual(remote_runtime_pid_file(settings, "upstream"), "/home/czy/.gpu-bridge/run/upstream.pid")
+        self.assertEqual(remote_runtime_log_file(settings, "upstream"), "/home/czy/.gpu-bridge/logs/upstream.log")
+        # each lane gets its own pid/log file, so two lanes never fight over one pidfile
+        self.assertEqual(remote_runtime_pid_file(settings, "upstream-mtp"), "/home/czy/.gpu-bridge/run/upstream-mtp.pid")
+        self.assertEqual(remote_runtime_log_file(settings, "upstream-mtp"), "/home/czy/.gpu-bridge/logs/upstream-mtp.log")
 
     def test_backend_relay_uses_ssh_stdio_to_wsl_nc_not_nat_forward(self):
         # The relay must carry bytes over the ssh channel to a WSL-local nc, never an
@@ -439,7 +531,7 @@ gateway_lock_file = "gateway.lock"
         with mock.patch.object(main, "check_command"), \
              mock.patch.object(main, "catalog_entry", return_value={"context_length": 4096}), \
              mock.patch.object(main, "runtime_lane"), \
-             mock.patch.object(main, "supported_cache_types", return_value=["turbo3_0"]), \
+             mock.patch.object(main, "supported_cache_types", return_value=["q4_0"]), \
              mock.patch.object(main, "check_ssh_connectivity"), \
              mock.patch.object(main, "ensure_backend_tunnel"), \
              mock.patch.object(main, "backend_api_json", return_value={"data": [{"id": "qwen-local"}]}), \
@@ -450,9 +542,9 @@ gateway_lock_file = "gateway.lock"
             ensure_runtime_loaded(
                 settings,
                 model_name="Qwen3.6-35B-A3B-UD-IQ3_S",
-                runtime_id="turboquant-cuda",
-                cache_type_k="turbo3_0",
-                cache_type_v="turbo3_0",
+                runtime_id="upstream-mtp",
+                cache_type_k="q4_0",
+                cache_type_v="q4_0",
                 flash_attn=True,
                 force_restart=False,
             )
@@ -516,7 +608,69 @@ gateway_lock_file = "gateway.lock"
         self.assertIn(b'"error"', handler.wfile.getvalue())
         self.assertIn(b'request was not retried automatically to avoid duplicate execution', handler.wfile.getvalue())
 
-    def test_proxy_retries_post_when_backend_connect_fails_before_send(self):
+    def test_proxy_streams_incrementally_instead_of_buffering_the_body(self):
+        # read(64k) on a chunked body blocks until 64KB accumulates, which held every SSE
+        # token back until generation finished. The proxy must use read1().
+        coordinator = DummyCoordinator()
+        handler = main.GatewayRequestHandler.__new__(main.GatewayRequestHandler)
+        handler.server = type("Server", (), {"coordinator": coordinator})()
+        handler.command = "POST"
+        handler.path = "/v1/chat/completions"
+        handler.headers = {"Content-Length": "0"}
+        handler.rfile = io.BytesIO(b"")
+        handler.wfile = io.BytesIO()
+        handler.close_connection = False
+        handler.send_response = lambda status, reason=None: None
+        handler.send_header = lambda key, value: None
+        handler.end_headers = lambda: None
+        chunks = [b"data: a\n\n", b"data: b\n\n", b"data: [DONE]\n\n"]
+        response = ChunkedFakeResponse(chunks)
+        StreamingHTTPConnection.response = response
+
+        with mock.patch.object(main.http.client, "HTTPConnection", StreamingHTTPConnection):
+            handler._proxy()
+
+        self.assertEqual(response.read_calls, 0)
+        # one call per chunk plus the terminating empty read
+        self.assertEqual(response.read1_calls, len(chunks) + 1)
+        self.assertEqual(handler.wfile.getvalue(), b"".join(chunks))
+
+    def test_proxy_does_not_write_an_error_response_after_headers_were_sent(self):
+        # Writing _send_json here would push a second HTTP status line into the middle of
+        # the body the client is already reading, and raise BrokenPipeError out of the
+        # handler as a socketserver traceback.
+        coordinator = DummyCoordinator()
+        handler = main.GatewayRequestHandler.__new__(main.GatewayRequestHandler)
+        handler.server = type("Server", (), {"coordinator": coordinator})()
+        handler.command = "POST"
+        handler.path = "/v1/chat/completions"
+        handler.headers = {"Content-Length": "0"}
+        handler.rfile = io.BytesIO(b"")
+        handler.wfile = BrokenPipeWriter(fail_after=1)
+        handler.close_connection = False
+        handler.send_response = lambda status, reason=None: None
+        handler.send_header = lambda key, value: None
+        handler.end_headers = lambda: None
+        handler._send_json = lambda status, payload: self.fail(
+            f"error response written after headers: {status} {payload}"
+        )
+        handler.log_message = lambda fmt, *args: None
+        StreamingHTTPConnection.response = ChunkedFakeResponse(
+            [b"data: a\n\n", b"data: b\n\n", b"data: [DONE]\n\n"]
+        )
+
+        with mock.patch.object(main.http.client, "HTTPConnection", StreamingHTTPConnection):
+            handler._proxy()  # must not raise
+
+        self.assertTrue(handler.close_connection)
+        self.assertTrue(handler._response_started)
+        self.assertEqual(coordinator.recover_calls, [])
+        self.assertEqual(coordinator.tunnel_refresh_calls, 0)
+        self.assertEqual(coordinator.end_calls, 1)
+
+    def test_proxy_rebuilds_the_relay_before_reloading_the_model_on_connect_failure(self):
+        # A refused connect is usually a dead ssh relay. Rebuilding it costs ~1s;
+        # recover_runtime_after_proxy_error force-restarts a healthy 27B for ~40s.
         coordinator = DummyCoordinator()
         handler = main.GatewayRequestHandler.__new__(main.GatewayRequestHandler)
         handler.server = type("Server", (), {"coordinator": coordinator})()
@@ -542,8 +696,44 @@ gateway_lock_file = "gateway.lock"
         self.assertEqual(ConnectFlakyHTTPConnection.connect_calls, 2)
         self.assertEqual(ConnectFlakyHTTPConnection.bodies, [payload])
         self.assertEqual(coordinator.ensure_calls, 2)
-        self.assertEqual(coordinator.recover_calls, ["ConnectionRefusedError"])
+        self.assertEqual(coordinator.tunnel_refresh_calls, 1)
+        self.assertEqual(coordinator.recover_calls, [])
         self.assertEqual(sent["status"][0][0], 200)
+
+    def test_proxy_escalates_to_runtime_recovery_when_relay_rebuild_does_not_help(self):
+        coordinator = DummyCoordinator()
+        handler = main.GatewayRequestHandler.__new__(main.GatewayRequestHandler)
+        handler.server = type("Server", (), {"coordinator": coordinator})()
+        handler.command = "POST"
+        handler.path = "/v1/chat/completions"
+        payload = b'{"messages":[{"role":"user","content":"hi"}]}'
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = SingleReadBytesIO(payload)
+        handler.wfile = io.BytesIO()
+        handler.close_connection = False
+        sent = {"status": []}
+        handler.send_response = lambda status, reason=None: sent["status"].append(status)
+        handler.send_header = lambda key, value: None
+        handler.end_headers = lambda: None
+        handler._send_json = lambda status, payload: self.fail(f"unexpected json error {status}: {payload}")
+        class TwiceRefusedConnection(ConnectFlakyHTTPConnection):
+            """Refuses the first connect and the one after the relay rebuild."""
+
+            def connect(self):
+                type(self).connect_calls += 1
+                if type(self).connect_calls < 3:
+                    raise ConnectionRefusedError("connection refused")
+
+        TwiceRefusedConnection.connect_calls = 0
+        TwiceRefusedConnection.bodies = []
+
+        with mock.patch.object(main.http.client, "HTTPConnection", TwiceRefusedConnection):
+            handler._proxy()
+
+        self.assertEqual(TwiceRefusedConnection.connect_calls, 3)
+        self.assertEqual(coordinator.tunnel_refresh_calls, 1)
+        self.assertEqual(coordinator.recover_calls, ["ConnectionRefusedError"])
+        self.assertEqual(sent["status"][0], 200)
 
     def test_setup_applies_client_read_timeout(self):
         handler = main.GatewayRequestHandler.__new__(main.GatewayRequestHandler)
@@ -586,7 +776,7 @@ request_timeout_seconds = 1800
 restart_mode = "on_demand"
 
 [runtime_defaults]
-default_runtime = "turboquant-cuda"
+default_runtime = "upstream"
 served_model_name = "qwen-local"
 n_gpu_layers = 99
 threads = 8
@@ -595,19 +785,28 @@ build_jobs = 8
 cuda_architectures = "89"
 flash_attn = true
 remote_state_dir = "~/.gpu-bridge"
-default_cache_type_k = "turbo3_0"
-default_cache_type_v = "turbo3_0"
+default_cache_type_k = "q4_0"
+default_cache_type_v = "q4_0"
 cmake_args = []
 build_targets = ["llama-server", "llama-bench"]
 extra_server_args = []
 
-[runtimes.turboquant-cuda]
+[runtimes.upstream]
 kind = "native"
-source_dir = "/home/czy/src/llama-cpp-turboquant-cuda"
-build_dir = "/home/czy/src/llama-cpp-turboquant-cuda/build-cuda89"
-server_bin = "/home/czy/src/llama-cpp-turboquant-cuda/build-cuda89/bin/llama-server"
-bench_bin = "/home/czy/src/llama-cpp-turboquant-cuda/build-cuda89/bin/llama-bench"
-supported_cache_types = ["turbo3_0"]
+source_dir = "/home/czy/src/llama.cpp"
+build_dir = "/home/czy/src/llama.cpp/build-cuda89"
+server_bin = "/home/czy/src/llama.cpp/build-cuda89/bin/llama-server"
+bench_bin = "/home/czy/src/llama.cpp/build-cuda89/bin/llama-bench"
+supported_cache_types = ["q4_0"]
+
+[runtimes."upstream-mtp"]
+kind = "native"
+source_dir = "/home/czy/src/llama.cpp"
+build_dir = "/home/czy/src/llama.cpp/build-cuda89"
+server_bin = "/home/czy/src/llama.cpp/build-cuda89/bin/llama-server"
+bench_bin = "/home/czy/src/llama.cpp/build-cuda89/bin/llama-bench"
+supported_cache_types = ["q4_0"]
+extra_server_args = ["--spec-type", "draft-mtp"]
 
 [state]
 state_dir = "/tmp/wingpu-tests"
@@ -646,7 +845,7 @@ gateway_lock_file = "gateway.lock"
         handler.end_headers = lambda: None
 
         with mock.patch.object(main, "selected_model", return_value="Qwen3.6-35B-A3B-UD-IQ3_S"), \
-             mock.patch.object(main, "selected_runtime", return_value="turboquant-cuda"), \
+             mock.patch.object(main, "selected_runtime", return_value="upstream"), \
              mock.patch.object(main, "catalog_entry", return_value={"context_length": 4096}), \
              mock.patch.object(main, "runtime_process_info", side_effect=AssertionError("should not inspect remote runtime")), \
              mock.patch.object(main.http.client, "HTTPConnection", side_effect=AssertionError("proxy should not dial backend")):
@@ -739,6 +938,110 @@ gateway_lock_file = "gateway.lock"
         stop_rt.assert_called_once()
         self.assertFalse(coord.stop_event.is_set())
 
+    def test_coordinator_init_does_no_remote_io(self):
+        # __init__ runs before the listening socket is bound; an ssh round trip here makes
+        # `wingpu gateway start` report "did not become ready" whenever the host is asleep.
+        settings = make_settings()
+        with mock.patch.object(main, "runtime_process_info", side_effect=AssertionError("remote probe in __init__")):
+            coord = main.GatewayCoordinator(settings)
+        self.assertFalse(coord.runtime_loaded)
+        self.assertEqual(coord.idle_status, "runtime_unknown")
+
+    def test_probe_runtime_state_fills_in_the_initial_belief(self):
+        settings = make_settings()
+        settings.state.state_dir.mkdir(parents=True, exist_ok=True)
+        coord = main.GatewayCoordinator(settings)
+        with mock.patch.object(main, "runtime_process_info", return_value={"running": True}), \
+             mock.patch.object(main, "selected_runtime", return_value="upstream"), \
+             mock.patch.object(coord, "write_state"):
+            coord.probe_runtime_state()
+        self.assertTrue(coord.runtime_loaded)
+        self.assertEqual(coord.idle_status, "runtime_loaded")
+
+    def test_probe_runtime_state_does_not_overwrite_a_request_that_already_loaded(self):
+        settings = make_settings()
+        coord = main.GatewayCoordinator(settings)
+        coord.runtime_loaded = True
+        coord.last_runtime_start_at = time.time()
+        with mock.patch.object(main, "runtime_process_info", return_value={"running": False}), \
+             mock.patch.object(main, "selected_runtime", return_value="upstream"):
+            coord.probe_runtime_state()
+        self.assertTrue(coord.runtime_loaded)
+
+    def test_ensure_runtime_loaded_skips_remote_probes_while_recently_verified(self):
+        settings = make_settings()
+        coord = main.GatewayCoordinator(settings)
+        with mock.patch.object(main, "ensure_runtime_loaded") as ensure, \
+             mock.patch.object(main, "selected_model", return_value="m"), \
+             mock.patch.object(main, "selected_runtime", return_value="upstream"), \
+             mock.patch.object(main, "selected_cache_type", return_value="q4_0"), \
+             mock.patch.object(coord, "write_state"):
+            coord.ensure_runtime_loaded()
+            self.assertEqual(ensure.call_count, 1)
+            coord.ensure_runtime_loaded()
+            coord.ensure_runtime_loaded()
+            self.assertEqual(ensure.call_count, 1)  # hot path: no further ssh work
+
+            # Expired TTL falls back to the full check.
+            coord.last_runtime_verified_at = time.time() - (main.RUNTIME_VERIFY_TTL_SECONDS + 1)
+            coord.ensure_runtime_loaded()
+            self.assertEqual(ensure.call_count, 2)
+
+    def test_hot_path_is_disabled_while_the_runtime_is_being_offloaded(self):
+        settings = make_settings()
+        coord = main.GatewayCoordinator(settings)
+        coord.runtime_loaded = True
+        coord.last_runtime_verified_at = time.time()
+        self.assertTrue(coord._runtime_recently_verified())
+        coord.offloading = True
+        self.assertFalse(coord._runtime_recently_verified())
+
+    def test_idle_offload_publishes_the_teardown_under_the_state_lock(self):
+        settings = make_settings()
+        settings.state.state_dir.mkdir(parents=True, exist_ok=True)
+        settings.state.gateway_pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        coord = main.GatewayCoordinator(settings)
+        coord.runtime_loaded = True
+        coord.last_runtime_verified_at = time.time()
+        coord.last_request_finished_at = 1.0  # ancient -> idle
+        seen = {}
+
+        def _stop(_settings):
+            seen["offloading"] = coord.offloading
+            seen["hot_path"] = coord._runtime_recently_verified()
+
+        with mock.patch.object(main, "stop_remote_runtime", side_effect=_stop), \
+             mock.patch.object(main, "stop_backend_tunnel"), \
+             mock.patch.object(main, "release_gpu_lease"), \
+             mock.patch.object(coord, "write_state"):
+            coord.maybe_idle_offload()
+
+        self.assertTrue(seen["offloading"])
+        self.assertFalse(seen["hot_path"])
+        self.assertFalse(coord.offloading)
+        self.assertFalse(coord.runtime_loaded)
+
+    def test_control_plane_ssh_multiplexes_over_a_shared_master(self):
+        settings = make_settings()
+        settings.state.state_dir.mkdir(parents=True, exist_ok=True)
+        args = main.ssh_base_args(settings)
+        self.assertIn("ControlMaster=auto", args)
+        self.assertIn(f"ControlPath={settings.ssh_control_socket}", args)
+        self.assertIn(f"ControlPersist={main.SSH_CONTROL_PERSIST_SECONDS}", args)
+        # The relay owns a different socket; sharing one would let a control-plane
+        # `ssh -O exit` tear down the live backend transport.
+        self.assertNotEqual(settings.ssh_control_socket, settings.backend_tunnel_socket)
+
+    def test_stop_backend_tunnel_targets_the_relay_socket_not_the_control_master(self):
+        settings = make_settings()
+        captured = []
+        with mock.patch.object(main, "run", side_effect=lambda argv, **kw: captured.append(argv)):
+            main.stop_backend_tunnel(settings)
+        argv = captured[0]
+        self.assertIn("-S", argv)
+        self.assertEqual(argv[argv.index("-S") + 1], str(settings.backend_tunnel_socket))
+        self.assertNotIn("ControlMaster=auto", argv)
+
 
 def make_settings():
     state = StateConfig(state_dir=io_path())
@@ -746,16 +1049,27 @@ def make_settings():
         connection=ConnectionConfig(api_key="sk-local"),
         gateway=GatewayConfig(),
         paths=PathsConfig(remote_home="/home/czy", remote_src_root="/home/czy/src", remote_models_root="/home/czy/models/Qwen"),
-        runtime_defaults=RuntimeDefaults(default_runtime="turboquant-cuda", served_model_name="qwen-local"),
+        runtime_defaults=RuntimeDefaults(default_runtime="upstream", served_model_name="qwen-local"),
+        # Two lanes so lane-aware code paths (per-lane pid/log files, cache-type
+        # validation, extra_server_args) are exercised against a real multi-lane config.
         runtimes={
-            "turboquant-cuda": RuntimeLane(
+            "upstream": RuntimeLane(
                 kind="native",
-                source_dir="/home/czy/src/llama-cpp-turboquant-cuda",
-                build_dir="/home/czy/src/llama-cpp-turboquant-cuda/build-cuda89",
-                server_bin="/home/czy/src/llama-cpp-turboquant-cuda/build-cuda89/bin/llama-server",
-                bench_bin="/home/czy/src/llama-cpp-turboquant-cuda/build-cuda89/bin/llama-bench",
-                supported_cache_types=["turbo3_0"],
-            )
+                source_dir="/home/czy/src/llama.cpp",
+                build_dir="/home/czy/src/llama.cpp/build-cuda89",
+                server_bin="/home/czy/src/llama.cpp/build-cuda89/bin/llama-server",
+                bench_bin="/home/czy/src/llama.cpp/build-cuda89/bin/llama-bench",
+                supported_cache_types=["q4_0"],
+            ),
+            "upstream-mtp": RuntimeLane(
+                kind="native",
+                source_dir="/home/czy/src/llama.cpp",
+                build_dir="/home/czy/src/llama.cpp/build-cuda89",
+                server_bin="/home/czy/src/llama.cpp/build-cuda89/bin/llama-server",
+                bench_bin="/home/czy/src/llama.cpp/build-cuda89/bin/llama-bench",
+                supported_cache_types=["q4_0"],
+                extra_server_args=["--spec-type", "draft-mtp"],
+            ),
         },
         state=state,
     )

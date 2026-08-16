@@ -34,11 +34,18 @@ BRIDGE_DIR = Path(__file__).resolve().parents[3]
 PROJECT_CONFIG_FILENAME = "wingpu.local.toml"
 GLOBAL_CONFIG_DIRNAME = "wingpu"
 
-CACHE_TYPE_ALIASES = {
-    "turbo2_0": "turbo2",
-    "turbo3_0": "turbo3",
-    "turbo4_0": "turbo4",
-}
+# How long an idle control-plane ssh master is kept alive for reuse.
+SSH_CONTROL_PERSIST_SECONDS = 300
+# How long a successful runtime verification is trusted before the gateway pays for
+# remote probes again. A backend that dies inside the window surfaces as a proxy
+# error and is recovered there, so this only trades a stale belief for latency.
+RUNTIME_VERIFY_TTL_SECONDS = 60.0
+
+# Maps a cache-type spelling accepted on the CLI to the spelling a runtime's
+# llama-server expects. Empty today: every lane in the catalog uses the same
+# names upstream llama.cpp uses (f16, bf16, q8_0, q4_0, q4_1). Kept as the
+# extension point for lanes that rename a cache type.
+CACHE_TYPE_ALIASES: dict[str, str] = {}
 
 
 class WingpuError(RuntimeError):
@@ -199,6 +206,11 @@ class Settings:
     @property
     def backend_tunnel_socket(self) -> Path:
         return self.state.state_dir / f"tunnel_{self.connection.host}_{self.gateway.backend_local_port}.sock"
+
+    @property
+    def ssh_control_socket(self) -> Path:
+        """Shared ControlMaster socket for control-plane ssh calls (never the relay's)."""
+        return self.state.state_dir / f"ssh_{self.connection.host}.sock"
 
     @property
     def backend_tunnel_pid_file(self) -> Path:
@@ -699,8 +711,30 @@ def ssh_options(settings: Settings) -> list[str]:
     ]
 
 
+def ssh_control_options(settings: Settings) -> list[str]:
+    """Multiplexing options for control-plane ssh calls (probes, wsl scripts).
+
+    Every gateway request used to pay one or two full ssh handshakes just to ask whether
+    llama-server is alive. Sharing a single persistent master turns those into a local
+    unix-socket round trip. Deliberately NOT part of ssh_options(): the relay declares its
+    own ControlPath, and stop_backend_tunnel passes -S, which must not collide with this one.
+    """
+    try:
+        settings.state.state_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return []
+    return [
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        f"ControlPath={settings.ssh_control_socket}",
+        "-o",
+        f"ControlPersist={SSH_CONTROL_PERSIST_SECONDS}",
+    ]
+
+
 def ssh_base_args(settings: Settings) -> list[str]:
-    return ["ssh", *ssh_options(settings), settings.connection.host]
+    return ["ssh", *ssh_options(settings), *ssh_control_options(settings), settings.connection.host]
 
 
 def check_ssh_connectivity(settings: Settings) -> None:
@@ -1451,8 +1485,15 @@ class GatewayCoordinator:
         self.last_request_finished_at: float | None = None
         self.last_runtime_start_at: float | None = None
         self.last_offload_at: float | None = None
-        self.runtime_loaded = runtime_process_info(settings, selected_runtime(settings)).get("running", False)
-        self.idle_status = "runtime_loaded" if self.runtime_loaded else "runtime_offloaded"
+        self.last_runtime_verified_at: float | None = None
+        # Set while the runtime is being torn down, so a request racing in cannot take the
+        # "recently verified" hot path past a backend that is going away.
+        self.offloading = False
+        # Never probe the remote host here: __init__ runs before the listening socket is
+        # bound, so a sleeping Windows box would turn a 20s ssh timeout into "gateway did
+        # not become ready". Bind first, probe from probe_runtime_state() afterwards.
+        self.runtime_loaded = False
+        self.idle_status = "runtime_unknown"
         self.server: ThreadingHTTPServer | None = None
 
     def write_state(self) -> None:
@@ -1509,8 +1550,45 @@ class GatewayCoordinator:
                 self.idle_status = "runtime_loaded"
             self.write_state()
 
+    def probe_runtime_state(self) -> None:
+        """Fill in the initial runtime_loaded belief. Safe to run after the port is bound."""
+        try:
+            running = bool(runtime_process_info(self.settings, selected_runtime(self.settings)).get("running", False))
+        except Exception:  # pylint: disable=broad-except
+            return
+        with self.state_lock:
+            if self.last_runtime_start_at is not None or self.last_offload_at is not None:
+                # A request (or an offload) already established the truth; do not overwrite it.
+                return
+            self.runtime_loaded = running
+            self.idle_status = "runtime_loaded" if running else "runtime_offloaded"
+            if running:
+                self.last_runtime_verified_at = time.time()
+                self.last_runtime_start_at = time.time()
+            self.write_state()
+
+    def _runtime_recently_verified(self) -> bool:
+        with self.state_lock:
+            if self.offloading or not self.runtime_loaded or self.last_runtime_verified_at is None:
+                return False
+            return (time.time() - self.last_runtime_verified_at) < RUNTIME_VERIFY_TTL_SECONDS
+
+    def _mark_runtime_verified(self) -> None:
+        with self.state_lock:
+            self.runtime_loaded = True
+            self.last_runtime_start_at = time.time()
+            self.last_runtime_verified_at = time.time()
+            self.idle_status = "runtime_loaded"
+            self.write_state()
+
     def ensure_runtime_loaded(self) -> None:
+        # Hot path: a runtime verified moments ago is still loaded. Skipping this avoids
+        # two ssh round trips (connectivity check + process probe) per chat request.
+        if self._runtime_recently_verified():
+            return
         with self.start_lock:
+            if self._runtime_recently_verified():
+                return
             ensure_runtime_loaded(
                 self.settings,
                 selected_model(self.settings),
@@ -1520,11 +1598,16 @@ class GatewayCoordinator:
                 self.settings.runtime_defaults.flash_attn,
                 force_restart=False,
             )
+            self._mark_runtime_verified()
+
+    def refresh_backend_tunnel(self) -> None:
+        """Rebuild the ssh relay without touching the loaded model."""
+        with self.start_lock:
             with self.state_lock:
-                self.runtime_loaded = True
-                self.last_runtime_start_at = time.time()
-                self.idle_status = "runtime_loaded"
-                self.write_state()
+                # The relay is suspect, so the runtime belief is no longer freshly proven.
+                self.last_runtime_verified_at = None
+            stop_backend_tunnel(self.settings)
+            ensure_backend_tunnel(self.settings)
 
     def recover_runtime_after_proxy_error(self, exc: Exception) -> None:
         with self.start_lock:
@@ -1541,20 +1624,22 @@ class GatewayCoordinator:
                 self.settings.runtime_defaults.flash_attn,
                 force_restart=True,
             )
-            with self.state_lock:
-                self.runtime_loaded = True
-                self.last_runtime_start_at = time.time()
-                self.idle_status = "runtime_loaded"
-                self.write_state()
+            self._mark_runtime_verified()
 
     def offload_runtime(self, *, reason: str = "manual") -> dict[str, Any]:
         with self.start_lock:
             with self.state_lock:
                 if self.active_requests > 0:
                     raise WingpuError("Cannot offload while requests are active.")
-            stop_remote_runtime(self.settings)
-            stop_backend_tunnel(self.settings)
-            release_gpu_lease(self.settings)
+                self.offloading = True
+                self.last_runtime_verified_at = None
+            try:
+                stop_remote_runtime(self.settings)
+                stop_backend_tunnel(self.settings)
+                release_gpu_lease(self.settings)
+            finally:
+                with self.state_lock:
+                    self.offloading = False
             with self.state_lock:
                 self.runtime_loaded = False
                 self.last_offload_at = time.time()
@@ -1592,13 +1677,22 @@ class GatewayCoordinator:
                     return
                 if time.time() - last_activity < self.settings.gateway.idle_timeout_seconds:
                     return
-            # Re-check after releasing state_lock — double-check pattern.
+            # Final check-and-commit, in the same critical section that publishes the
+            # teardown: a request arriving before this wins (active_requests aborts the
+            # offload), one arriving after sees `offloading` and takes the cold path
+            # rather than the hot path into a backend that is being stopped.
             with self.state_lock:
                 if self.active_requests > 0 or not self.runtime_loaded:
                     return
-            stop_remote_runtime(self.settings)
-            stop_backend_tunnel(self.settings)
-            release_gpu_lease(self.settings)
+                self.offloading = True
+                self.last_runtime_verified_at = None
+            try:
+                stop_remote_runtime(self.settings)
+                stop_backend_tunnel(self.settings)
+                release_gpu_lease(self.settings)
+            finally:
+                with self.state_lock:
+                    self.offloading = False
             with self.state_lock:
                 self.runtime_loaded = False
                 self.last_offload_at = time.time()
@@ -1618,6 +1712,10 @@ class GatewayCoordinator:
 class GatewayRequestHandler(BaseHTTPRequestHandler):
     server_version = "wingpu-gateway/1.0"
     protocol_version = "HTTP/1.1"
+    # True once a status line + headers have gone out for the current request. After
+    # that point the client is reading a body, so no error response may be written:
+    # _send_json would inject a second HTTP status line into the middle of it.
+    _response_started = False
 
     @property
     def coordinator(self) -> GatewayCoordinator:
@@ -1626,6 +1724,14 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
     def setup(self) -> None:
         super().setup()
         self.connection.settimeout(self.coordinator.settings.gateway.client_read_timeout_seconds)
+
+    def handle_one_request(self) -> None:
+        # A client that walks away mid-stream is routine, not an error. Without this the
+        # BrokenPipeError escapes into socketserver and lands as a traceback in gateway.log.
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def log_message(self, format: str, *args: Any) -> None:
         sys.stdout.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), format % args))
@@ -1759,6 +1865,10 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         return self.command in {"GET", "HEAD", "OPTIONS"}
 
     def _can_retry_proxy_attempt(self, error: ProxyAttemptError) -> bool:
+        if self._response_started:
+            # The client already has a status line and part of a body; replaying the
+            # request would append a second response to it.
+            return False
         if not self._is_retryable_proxy_error(error.exc):
             return False
         if error.stage == "connect":
@@ -1828,9 +1938,15 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 self.send_header(key, value)
             self.send_header("Connection", "close")
             self.end_headers()
+            self._response_started = True
             try:
                 while True:
-                    chunk = resp.read(64 * 1024)
+                    # read1(), not read(): HTTPResponse.read(n) on a chunked body blocks
+                    # until it has accumulated n bytes or the stream ends, which turns SSE
+                    # into a single 64KB-granular delivery. read1() returns whatever the
+                    # socket has right now, so token deltas reach the client as they arrive.
+                    # It still returns b"" only at EOF, so the loop condition is unchanged.
+                    chunk = resp.read1(64 * 1024)
                     if not chunk:
                         break
                     self.wfile.write(chunk)
@@ -1848,23 +1964,53 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _fail(self, status_code: int, payload: dict[str, Any]) -> None:
+        """Report a proxy failure to the client, if it is still safe to write one."""
+        if self._response_started:
+            # Headers are already on the wire. Anything written now would be read as
+            # body bytes, so the only honest signal left is closing the connection.
+            self.log_message("proxy failed mid-stream, closing connection: %s", payload.get("error", ""))
+            self.close_connection = True
+            return
+        try:
+            self._send_json(status_code, payload)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
+    def _proxy_with_recovery(self, body: bytes | None) -> None:
+        try:
+            self._proxy_once(body)
+            return
+        except ProxyAttemptError as exc:
+            failure = exc
+        if not self._can_retry_proxy_attempt(failure):
+            raise WingpuError(self._unsafe_retry_message(failure)) from failure.exc
+        if failure.stage == "connect":
+            # A refused/dropped connect is far more often a stale ssh relay than a dead
+            # model. Rebuild the cheap thing first: reloading a healthy 27B costs ~40s.
+            self.coordinator.refresh_backend_tunnel()
+            try:
+                self._proxy_once(body)
+                return
+            except ProxyAttemptError as exc:
+                failure = exc
+            if not self._can_retry_proxy_attempt(failure):
+                raise WingpuError(self._unsafe_retry_message(failure)) from failure.exc
+        self.coordinator.recover_runtime_after_proxy_error(failure.exc)
+        self._proxy_once(body)
+
     def _proxy(self) -> None:
+        self._response_started = False
         self.coordinator.begin_request()
         try:
             body = self._read_request_body()
-            try:
-                self._proxy_once(body)
-            except ProxyAttemptError as exc:
-                if not self._can_retry_proxy_attempt(exc):
-                    raise WingpuError(self._unsafe_retry_message(exc)) from exc.exc
-                self.coordinator.recover_runtime_after_proxy_error(exc.exc)
-                self._proxy_once(body)
+            self._proxy_with_recovery(body)
         except WingpuError as exc:
-            self._send_json(502, {"ok": False, "error": str(exc)})
+            self._fail(502, {"ok": False, "error": str(exc)})
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
         except Exception as exc:
-            self._send_json(502, {"ok": False, "error": f"Gateway proxy error: {exc}"})
+            self._fail(502, {"ok": False, "error": f"Gateway proxy error: {exc}"})
         finally:
             self.coordinator.end_request()
 
@@ -1899,11 +2045,14 @@ def serve_gateway(settings: Settings) -> None:
     coordinator = GatewayCoordinator(settings)
     settings.state.gateway_pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
     coordinator.write_state()
-    idle_thread = threading.Thread(target=coordinator.idle_loop, daemon=True)
-    idle_thread.start()
+    # Bind before touching the remote host. Everything above this line is local, so
+    # `wingpu gateway start` reports ready even when the Windows box is asleep.
     server = ThreadingHTTPServer((settings.gateway.listen_host, settings.connection.local_port), GatewayRequestHandler)
     server.coordinator = coordinator  # type: ignore[attr-defined]
     coordinator.server = server
+    threading.Thread(target=coordinator.probe_runtime_state, daemon=True).start()
+    idle_thread = threading.Thread(target=coordinator.idle_loop, daemon=True)
+    idle_thread.start()
 
     def _handle_signal(signum: int, frame: Any) -> None:
         coordinator.stop_event.set()
