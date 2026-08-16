@@ -29,7 +29,7 @@ Experimental inner runtime:
 - benchmark settings can change
 - the remote model can be automatically unloaded when idle
 
-That design lets us experiment with Qwen, KV compression, and TurboQuant without having to keep reconfiguring the Mac app layer.
+That design lets us experiment with Qwen models, KV cache settings, and runtime lanes without having to keep reconfiguring the Mac app layer.
 
 ## 2. Architecture
 
@@ -80,7 +80,7 @@ That design lets us experiment with Qwen, KV compression, and TurboQuant without
 |  +-------------------+      +------------------------------+ |
 |  | runtime lane      | ---> | llama-server / llama-bench   | |
 |  | upstream or       |      | loads GGUF from model store  | |
-|  | turboquant-cuda   |      +---------------+--------------+ |
+|  | upstream-mtp      |      +---------------+--------------+ |
 |  +-------------------+                      |                |
 +---------------------------------------------|----------------+
                                               |
@@ -238,17 +238,20 @@ wingpu status
 
 ```bash
 wingpu build upstream
-wingpu build turboquant-cuda
+wingpu build upstream-mtp
 ```
+
+Both lanes share the same `llama.cpp` checkout and build directory, so building
+one of them is enough to refresh the binaries for both.
 
 ### Select model, runtime, and KV settings
 
 ```bash
 wingpu model list
 wingpu model current
-wingpu model set Qwen3.6-27B-MTP-UD-IQ2_M
+wingpu model set Qwen3.8-27B-UD-Q3_K_XL
 wingpu runtime list
-wingpu runtime set upstream-mtp
+wingpu runtime set upstream
 wingpu kv show
 wingpu kv set --k q4_0 --v q4_0
 ```
@@ -299,40 +302,32 @@ Use it when you want:
 - clean comparison runs
 - fewer experimental variables
 
-This lane is not a drop-in replacement for `turboquant-cuda` while the active setup depends on TurboQuant-specific KV cache types such as `turbo3_0`.
-Only switch the daily runtime back to official upstream once those cache types, or an equivalent long-context memory path, are supported there.
+This is the shipped default lane. It builds from the official `llama.cpp` master checkout on the
+remote host and supports the standard KV cache types (`f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`).
 
 ### `upstream-mtp`
 
-Native upstream `llama.cpp` with Qwen3.6 MTP speculative decoding enabled through `--spec-type draft-mtp`.
+Native upstream `llama.cpp` with MTP speculative decoding enabled through `--spec-type draft-mtp`.
 
 Use it when you want:
 
-- the default bridge runtime
-- faster long-context decode throughput
-- the current 27B MTP model path on the 16 GiB GPU
+- faster decode throughput
+- speculative decoding without a separate draft model
 
-The current default uses `Qwen3.6-27B-MTP-UD-IQ2_M` with `q4_0` K/V cache and `--spec-draft-n-max 3`.
+The Qwen3.6 setup needed a separate `-MTP-GGUF` download for this lane. The Unsloth Qwen3.8
+GGUFs no longer do: they embed the MTP head, and `llama.cpp` loads it only when
+`--spec-type draft-mtp` is passed, so the plain `upstream` lane pays no VRAM for it.
 
-### `turboquant-cuda`
+Measured 2026-08-16 on `Qwen3.8-27B-UD-Q3_K_XL` at 65536 ctx with `q4_0` K/V: 65.7-70.0 tok/s
+decode versus 38.1 tok/s on `upstream`, for about 1.0 GiB of extra VRAM. See
+`reports/benchmark-2026-08-16-qwen38-27b.md`. The shipped default lane is still `upstream`.
 
-CUDA-focused TurboQuant fork used for KV-cache experiments.
-This lane is a customized fork and should be updated conservatively: pull/rebuild its custom branch when that branch is available, but do not replace it with official upstream just because upstream is newer.
-
-Use it when you want:
-
-- longer-context KV-cache experiments
-- memory-pressure comparisons
-- TurboQuant vs baseline benchmarks
-
-This lane is experimental and should be treated accordingly.
-
-To switch back to TurboQuant from the MTP default:
+To switch from the `upstream` default to the MTP lane:
 
 ```bash
-wingpu runtime set turboquant-cuda
-wingpu model set Qwen3.6-27B-UD-IQ2_M
-wingpu kv set --k turbo3 --v turbo3
+wingpu runtime set upstream-mtp
+wingpu model set Qwen3.8-27B-UD-Q3_K_XL
+wingpu kv set --k q4_0 --v q4_0
 wingpu restart
 ```
 

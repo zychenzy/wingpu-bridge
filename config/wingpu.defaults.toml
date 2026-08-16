@@ -58,7 +58,7 @@ bench_bin = "{remote_src_root}/llama.cpp/build-cuda89/bin/llama-bench"
 default_branch = "master"
 supported_cache_types = ["f16", "bf16", "q8_0", "q4_0", "q4_1"]
 extra_server_args = []
-notes = "Upstream llama.cpp CUDA baseline."
+notes = "Upstream llama.cpp CUDA baseline, no speculative decoding. Slower to decode than upstream-mtp but needs ~1.0 GiB less VRAM, so it is the lane to use for the longest contexts (see Qwen3.8-27B-UD-IQ2_M at 262144)."
 
 [runtimes."upstream-mtp"]
 kind = "native"
@@ -69,18 +69,19 @@ bench_bin = "{remote_src_root}/llama.cpp/build-cuda89/bin/llama-bench"
 default_branch = "master"
 supported_cache_types = ["f16", "bf16", "q8_0", "q4_0", "q4_1"]
 extra_server_args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "3"]
-notes = "Upstream llama.cpp with Qwen3.6 MTP speculative decoding enabled."
-
-[runtimes."turboquant-cuda"]
-kind = "native"
-source_dir = "{remote_src_root}/llama-cpp-turboquant-cuda"
-build_dir = "{remote_src_root}/llama-cpp-turboquant-cuda/build-cuda89"
-server_bin = "{remote_src_root}/llama-cpp-turboquant-cuda/build-cuda89/bin/llama-server"
-bench_bin = "{remote_src_root}/llama-cpp-turboquant-cuda/build-cuda89/bin/llama-bench"
-default_branch = "feature/turboquant-kv-cache"
-supported_cache_types = ["f16", "bf16", "q8_0", "q4_0", "q4_1", "turbo2_0", "turbo3_0", "turbo4_0", "turbo2", "turbo3", "turbo4"]
-extra_server_args = []
-notes = "spiritbuun CUDA-focused TurboQuant fork on feature/turboquant-kv-cache."
+notes = """Default lane. MTP speculative decoding against the MTP head embedded in the Unsloth \
+Qwen3.8-27B GGUFs (blk.64.nextn.*, nextn_predict_layers = 1), so no separate MTP model file is \
+needed the way Qwen3.6 required one. llama.cpp loads those tensors only when --spec-type \
+draft-mtp is set, so the plain upstream lane pays no VRAM for them. Measured 2026-08-17 on \
+Qwen3.8-27B-UD-Q3_K_XL at 65536 ctx with q4_0 K/V, greedy decode: 66.3 tok/s versus 38.1 tok/s \
+on the upstream lane (+74%), for about 1.0 GiB of extra VRAM. --spec-draft-n-max 2 / 3 / 4 \
+measured 64.7 / 66.3 / 67.0 tok/s with 67% / 56% / 47% draft acceptance; that spread is inside \
+the run-to-run noise (repeat n=3 runs gave 62.4-66.3), so 3 is chosen as a middle value that \
+still reproduces n=2's greedy output byte for byte, while n=4 diverges and costs 150 MiB more. \
+Speculative verification batches tokens differently from plain decode, so greedy output is not \
+bit-identical to the upstream lane; it is deterministic within a lane. llama.cpp issue #27122 \
+reports MTP lockups with Qwen3.8, but only under --split-mode tensor on multi-GPU hosts; this \
+single-GPU host uses the default layer split and was stable across every probe."""
 
 [broker]
 # Shared GPU lease arbiter on the WSL host (wsl/gpu_broker.py). It ensures only one
@@ -95,7 +96,11 @@ vram_floor_mb = 2000
 free_timeout_seconds = 60
 acquire_wait_seconds = 30
 busy_util_pct = 15
-watchdog_idle_timeout_seconds = 900
+# watchdog_idle_timeout_seconds must stay >= gateway.idle_timeout_seconds. The watchdog
+# is a backstop for a bridge that stopped reporting; the gateway's own idle offload has
+# to fire first, because only it releases the GPU lease and updates gateway state. The
+# watchdog is off by default, so this only matters once it is started explicitly.
+watchdog_idle_timeout_seconds = 2100
 watchdog_poll_seconds = 15
 
 [state]

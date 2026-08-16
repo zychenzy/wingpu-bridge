@@ -13,7 +13,7 @@ The published project keeps one stable app contract:
 - Mac-side control with the `wingpu` CLI
 - A lightweight always-on local gateway on macOS
 - Windows + WSL + NVIDIA runtime management over SSH
-- Native `llama.cpp` and TurboQuant-CUDA runtime lanes
+- Native `llama.cpp` runtime lanes, with and without MTP speculative decoding
 - GGUF model catalog and model switching without changing app-side config
 - Automatic idle offload of the remote model runtime
 - Local benchmark and experiment workflows for long-context Qwen use
@@ -68,8 +68,8 @@ The repo-local `bridge/config/wingpu.local.toml` is only a fallback when the cen
 
 ```bash
 wingpu build upstream
-wingpu runtime set upstream-mtp
-wingpu model set Qwen3.6-27B-MTP-UD-IQ2_M
+wingpu runtime set upstream
+wingpu model set Qwen3.8-27B-UD-Q3_K_XL
 wingpu kv set --k q4_0 --v q4_0
 ```
 
@@ -133,16 +133,19 @@ It is fail-open (a broker problem never blocks a start) and can be turned off wi
 
 - [Project Guide](docs/README.md)
 
-## TurboQuant Fallback
+## Switching Runtime Lanes
 
-The default lane is the upstream MTP setup. To switch the bridge back to the TurboQuant long-context fallback:
+The default lane is plain `upstream`. To switch the bridge to the MTP speculative-decoding lane:
 
 ```bash
-wingpu runtime set turboquant-cuda
-wingpu model set Qwen3.6-27B-UD-IQ2_M
-wingpu kv set --k turbo3 --v turbo3
+wingpu runtime set upstream-mtp
+wingpu model set Qwen3.8-27B-UD-Q3_K_XL
+wingpu kv set --k q4_0 --v q4_0
 wingpu restart
 ```
+
+Both lanes build from the same `llama.cpp` checkout. See
+[Project Guide, section 8](docs/README.md) for the trade-offs.
 
 ## Local-Only Areas
 

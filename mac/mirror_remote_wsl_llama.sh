@@ -29,7 +29,7 @@ This directory is a repo-local mirror of the remote WSL llama setup on:
 
 Included:
 
-- source trees for \`llama.cpp\` and \`llama-cpp-turboquant-cuda\`
+- source tree for \`llama.cpp\`
 - \`~/.gpu-bridge\` runtime state and logs
 - narrow admin wrapper scripts from \`/usr/local/sbin\`
 - metadata snapshots for git state, runtime state, model inventory, and system info
@@ -64,7 +64,7 @@ EOF
 
 ssh_wsl <<'EOF' > "${OUT_DIR}/metadata/git_state.txt"
 set -euo pipefail
-for repo in ${REMOTE_SRC_ROOT}/llama.cpp ${REMOTE_SRC_ROOT}/llama-cpp-turboquant-cuda; do
+for repo in ${REMOTE_SRC_ROOT}/llama.cpp; do
   if [[ -d "$repo/.git" ]]; then
     echo "== $repo =="
     git -C "$repo" remote -v | sed -n '1,4p'
@@ -105,9 +105,9 @@ echo "[gguf files]"
 find ${REMOTE_MODELS_ROOT} -maxdepth 2 -type f -name '*.gguf' | sort || true
 EOF
 
-ssh_wsl <<'EOF' > "${OUT_DIR}/metadata/help_turbo.txt"
+ssh_wsl <<'EOF' > "${OUT_DIR}/metadata/help_cache_types.txt"
 set -euo pipefail
-${REMOTE_SRC_ROOT}/llama-cpp-turboquant-cuda/build-cuda89/bin/llama-server --help 2>&1 | grep -i -E 'cache-type-k|cache-type-v|turbo|flash-attn' || true
+${REMOTE_SRC_ROOT}/llama.cpp/build-cuda89/bin/llama-server --help 2>&1 | grep -i -E 'cache-type-k|cache-type-v|flash-attn' || true
 EOF
 
 ssh_wsl <<'EOF' | tar -xf - -C "${OUT_DIR}/src"
@@ -119,8 +119,7 @@ tar \
   --exclude='build-*' \
   --exclude='build_*' \
   -cf - \
-  llama.cpp \
-  llama-cpp-turboquant-cuda
+  llama.cpp
 EOF
 
 ssh_wsl <<'EOF' | tar -xf - -C "${OUT_DIR}/home/remote-user"

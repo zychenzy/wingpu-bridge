@@ -1,60 +1,18 @@
 {
   "model_root": "{remote_models_root}",
-  "default_model": "Qwen3.6-27B-MTP-UD-IQ2_M",
+  "default_model": "Qwen3.8-27B-UD-Q3_K_XL",
   "models": {
-    "Qwen3.6-27B-Q3_K_M": {
-      "gguf_relpath": "Qwen3.6-27B-GGUF/Qwen3.6-27B-Q3_K_M.gguf",
-      "context_length": 131072,
+    "Qwen3.8-27B-UD-Q3_K_XL": {
+      "gguf_relpath": "Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q3_K_XL.gguf",
+      "context_length": 65536,
       "enabled": true,
-      "notes": "27B Q3_K_M variant for a slightly higher-quality option within the Qwen3.6 GGUF set."
+      "notes": "Quality default, and the model the default upstream-mtp lane is tuned for. Unsloth Dynamic V3.0 3-bit (12.5 GiB of weights), Unsloth's own recommendation for 16 GB VRAM. 65536 is the MTP-safe cap: on the 16376 MiB RTX 4070 Ti SUPER with q4_0 K/V, flash attention and --spec-draft-n-max 3 it loads at 15205 MiB, leaving 1171 MiB free, and decodes at 66.3 tok/s. On the plain upstream lane the same model is ~1.0 GiB lighter and goes further: 32768 = 14046 MiB, 65536 = 14737, 98304 = 15427, 131072 = 15621 MiB, and 131072 was validated with a 120k-token prefill that answered a needle question correctly. So for contexts above 65536, switch to `wingpu runtime set upstream` and raise this with `wingpu model context`."
     },
-    "Qwen3.6-27B-Q3_K_S": {
-      "gguf_relpath": "Qwen3.6-27B-GGUF/Qwen3.6-27B-Q3_K_S.gguf",
-      "context_length": 131072,
-      "enabled": true,
-      "notes": "27B Q3_K_S variant for a smaller, faster long-context option within the Qwen3.6 GGUF set."
-    },
-    "Qwen3.6-27B-UD-IQ2_M": {
-      "gguf_relpath": "Qwen3.6-27B-GGUF/Qwen3.6-27B-UD-IQ2_M.gguf",
-      "context_length": 32768,
-      "enabled": true,
-      "notes": "27B UD IQ2_M variant for testing lower-VRAM long-context behavior on TurboQuant."
-    },
-    "Qwen3.6-27B-UD-IQ2_XXS": {
-      "gguf_relpath": "Qwen3.6-27B-GGUF/Qwen3.6-27B-UD-IQ2_XXS.gguf",
-      "context_length": 131072,
-      "enabled": true,
-      "notes": "27B UD IQ2_XXS variant for testing the smallest practical long-context 27B option on TurboQuant."
-    },
-    "Qwen3.6-27B-MTP-Q3_K_S": {
-      "gguf_relpath": "Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-Q3_K_S.gguf",
-      "context_length": 131072,
-      "enabled": true,
-      "notes": "27B MTP Q3_K_S variant for highest-quality MTP attempts that may still fit only at shorter contexts on 16 GiB GPUs."
-    },
-    "Qwen3.6-27B-MTP-UD-IQ2_M": {
-      "gguf_relpath": "Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-IQ2_M.gguf",
-      "context_length": 32768,
-      "enabled": true,
-      "notes": "27B MTP UD IQ2_M variant selected as the main 16 GiB long-context MTP candidate."
-    },
-    "Qwen3.6-27B-MTP-UD-IQ2_XXS": {
-      "gguf_relpath": "Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-IQ2_XXS.gguf",
-      "context_length": 131072,
-      "enabled": true,
-      "notes": "27B MTP UD IQ2_XXS fallback for VRAM-constrained 100K-130K context experiments."
-    },
-    "Qwen3.6-35B-A3B-UD-IQ3_S": {
-      "gguf_relpath": "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+    "Qwen3.8-27B-UD-IQ2_M": {
+      "gguf_relpath": "Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ2_M.gguf",
       "context_length": 262144,
       "enabled": true,
-      "notes": "35B A3B UD IQ3_S variant for good balance with high quality and speed within the new Qwen3.6 GGUF set."
-    },
-    "Qwen3.6-35B-A3B-UD-Q3_K_S": {
-      "gguf_relpath": "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_S.gguf",
-      "context_length": 131072,
-      "enabled": true,
-      "notes": "35B A3B UD Q3_K_S variant for good balance with high quality and speed within the new Qwen3.6 GGUF set."
+      "notes": "Long-context option. RUN THIS ON THE upstream LANE, NOT THE DEFAULT upstream-mtp LANE: `wingpu runtime set upstream`. Unsloth Dynamic V3.0 2-bit (9.6 GiB of weights), leaving far more room for KV cache. On the upstream lane it runs Qwen3.8's full native 262144 context on 16 GB with q4_0 K/V: a 250256-token prefill peaked at 15739 MiB (~640 MiB free) and answered a needle question correctly. Under upstream-mtp the MTP head adds ~1.0 GiB: it still loads at 262144 (16039 MiB, only ~340 MiB free) and short generations work at 63.0 tok/s, but that is below the ~500 MiB safety bar and leaves no room for the compute buffers a deep prefill needs, so a genuine 256k run would likely OOM. Either switch to the upstream lane for full context, or stay on upstream-mtp and drop this to 131072 or below. KV costs about 21.6 KiB/token because only 16 of 64 layers use full attention; the rest are Gated DeltaNet linear-attention layers with fixed-size recurrent state."
     }
   }
 }
