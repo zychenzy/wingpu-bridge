@@ -41,6 +41,27 @@ flash_attn = true
 remote_state_dir = "~/.gpu-bridge"
 default_cache_type_k = "q4_0"
 default_cache_type_v = "q4_0"
+# Reasoning controls for hybrid thinking models, passed to llama-server as
+# --reasoning-effort / --reasoning-budget. Empty string and -1 mean "do not pass the flag".
+#
+# reasoning_effort: the Qwen3.8 chat template accepts only xhigh (its default), medium and
+# low; 'high' is aliased to xhigh, and anything else (minimal, max, none, default) makes the
+# template raise, which llama-server returns as HTTP 500 on every request. Measured
+# 2026-08-17 on Qwen3.8-27B-UD-Q3_K_XL, upstream-mtp, greedy, on "why is Canberra the
+# capital of Australia":
+#   xhigh  2441 chars of thinking, 524 chars of answer, 12.1s: thinks longest, answers tersest.
+#   medium 1242 chars of thinking, 1606 chars of answer, 10.1s: half the thinking, 3x the answer.
+#   low    1578 chars of thinking, 1546 chars of answer, 11.1s: no shorter than medium in practice.
+# Thinking length is driven more by the question than by the level (across three questions the
+# median was 578/726/600 chars for xhigh/medium/low); what the level reliably changes is answer
+# length. medium is the default because it is the level that spends the least of a small token
+# budget on thinking while still returning a full answer.
+reasoning_effort = "medium"
+# reasoning_budget: hard cap in tokens on the thinking block; -1 = unrestricted. N>0 works
+# (64 cut the probe above to 302 chars of thinking / 169 total tokens), but note that 0 is a
+# no-op on build 10454, NOT a no-thinking switch. For no-thinking mode see the README section
+# "Reasoning behavior".
+reasoning_budget = -1
 cmake_args = [
   "-DGGML_CUDA=ON",
   "-DGGML_NATIVE=OFF",

@@ -111,6 +111,68 @@ wingpu model list
 wingpu model current
 ```
 
+## Reasoning Behavior
+
+Qwen3.8 is a hybrid thinking model. Every chat completion is split by `llama-server`: the
+thinking trace goes to `choices[0].message.reasoning_content` and the actual answer goes to
+`choices[0].message.content`. The gateway is a byte proxy and never rewrites a request, so
+everything below is either a server-side config key or a field your client sends.
+
+### Server-side defaults
+
+`[runtime_defaults]` in the config carries two keys, passed to `llama-server` as
+`--reasoning-effort` and `--reasoning-budget`:
+
+```toml
+[runtime_defaults]
+reasoning_effort = "medium"   # "" leaves the flag off (template default)
+reasoning_budget = -1         # -1 = unrestricted; N > 0 caps thinking at N tokens
+```
+
+The Qwen3.8 chat template accepts only `xhigh` (its own default), `medium` and `low`; `high`
+is an alias for `xhigh`. Any other level makes the template raise, which `llama-server`
+returns as HTTP 500 on *every* request, so `wingpu` validates the value when it loads the
+config instead of letting you find out one request at a time.
+
+`medium` is the shipped default. Measured on `Qwen3.8-27B-UD-Q3_K_XL` / `upstream-mtp`,
+`xhigh` thinks the longest and answers the tersest (2441 chars of thinking for 524 chars of
+answer on a standard question); `medium` roughly halves the thinking and triples the answer;
+`low` is no shorter than `medium` in practice. See the comments in
+`config/wingpu.defaults.toml` for the full numbers.
+
+### Small `max_tokens` returns empty content
+
+This is the one behavior worth knowing about up front. Thinking tokens are drawn from the
+same budget as the answer, and thinking comes first. With `max_tokens: 24` the response is
+`finish_reason: "length"` with a populated `reasoning_content` and an **empty** `content`, at
+every effort level. Nothing is broken; the budget simply ran out before the answer started.
+
+Three ways to get text back:
+
+1. **Give it room.** A thinking answer needs roughly 600+ completion tokens. This is the
+   right fix for a normal chat client.
+2. **Turn thinking off for that request.** Send `"reasoning_effort": "none"` in the request
+   body. `llama-server` intercepts this value before the chat template sees it and disables
+   thinking, so it does not hit the 500 that other unsupported levels do. A `max_tokens: 24`
+   request then returns real (truncated) prose.
+3. **Cap thinking per request.** Send `"reasoning_budget_tokens": N` to force the
+   end-of-thinking tag after N thinking tokens.
+
+### Running the bridge with no thinking at all
+
+Use the `-rea off` server flag, which maps to the template's `enable_thinking = false`:
+
+```toml
+[runtime_defaults]
+extra_server_args = ["-rea", "off"]
+```
+
+Every response then comes back with an empty `reasoning_content` and the full answer in
+`content`, and a per-request `reasoning_effort` cannot re-enable thinking.
+
+Note that `--reasoning-budget 0` is **not** a no-thinking switch: on llama.cpp build 10454 a
+budget of `0` is a no-op and full thinking still happens. Only `N > 0` is enforced.
+
 ## Shared GPU Broker
 
 The Windows host has one GPU shared by this bridge and its siblings. `wsl/gpu_broker.py` is a

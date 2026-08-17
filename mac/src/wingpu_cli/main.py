@@ -41,6 +41,18 @@ SSH_CONTROL_PERSIST_SECONDS = 300
 # error and is recovered there, so this only trades a stale belief for latency.
 RUNTIME_VERIFY_TTL_SECONDS = 60.0
 
+# How much of a failed command's output is carried into the raised WingpuError. A remote
+# cmake/ninja build prints thousands of lines and the real error is at the end, so the tail
+# is what matters; the caps keep a runaway log from filling the terminal.
+OUTPUT_TAIL_LINES = 50
+OUTPUT_TAIL_CHARS = 8000
+
+# Values llama-server's --reasoning-effort documents. wingpu checks against this set so a
+# typo fails at launch instead of turning every later chat request into an HTTP 500 from
+# the chat template. Which of these a given model accepts is template-specific: the
+# Qwen3.8 template takes only xhigh/medium/low (high aliases to xhigh) and raises on the rest.
+REASONING_EFFORT_LEVELS = ("default", "minimal", "low", "medium", "high", "xhigh", "max")
+
 # Maps a cache-type spelling accepted on the CLI to the spelling a runtime's
 # llama-server expects. Empty today: every lane in the catalog uses the same
 # names upstream llama.cpp uses (f16, bf16, q8_0, q4_0, q4_1). Kept as the
@@ -84,6 +96,10 @@ class RuntimeDefaults:
     remote_state_dir: str = "~/.gpu-bridge"
     default_cache_type_k: str = "f16"
     default_cache_type_v: str = "f16"
+    # Reasoning controls for hybrid thinking models. Empty / -1 means "do not pass the flag",
+    # which leaves llama-server on its own defaults (chat-template effort, unlimited thinking).
+    reasoning_effort: str = ""
+    reasoning_budget: int = -1
     cmake_args: list[str] = field(default_factory=list)
     build_targets: list[str] = field(default_factory=lambda: ["llama-server", "llama-bench"])
     extra_server_args: list[str] = field(default_factory=list)
@@ -407,6 +423,10 @@ def load_settings(host: str | None = None, distro: str | None = None, api_key: s
         env_overrides["runtime_defaults"]["threads"] = int(os.environ["LLAMA_THREADS"])
     if os.getenv("LLAMA_EXTRA_ARGS"):
         env_overrides["runtime_defaults"]["extra_server_args"] = shlex.split(os.environ["LLAMA_EXTRA_ARGS"])
+    if os.getenv("WINGPU_REASONING_EFFORT") is not None:
+        env_overrides["runtime_defaults"]["reasoning_effort"] = os.environ["WINGPU_REASONING_EFFORT"]
+    if os.getenv("WINGPU_REASONING_BUDGET"):
+        env_overrides["runtime_defaults"]["reasoning_budget"] = int(os.environ["WINGPU_REASONING_BUDGET"])
     if os.getenv("WINGPU_RUNTIME"):
         env_overrides["runtime_defaults"]["default_runtime"] = os.environ["WINGPU_RUNTIME"]
     if os.getenv("WINGPU_REMOTE_HOME"):
@@ -435,6 +455,7 @@ def load_settings(host: str | None = None, distro: str | None = None, api_key: s
         list(config["runtime_defaults"].get("extra_server_args", [])),
         source_label="runtime_defaults.extra_server_args",
     )
+    validate_reasoning_effort(config["runtime_defaults"].get("reasoning_effort", ""))
     runtimes = {
         runtime_id: RuntimeLane(**runtime_cfg)
         for runtime_id, runtime_cfg in config["runtimes"].items()
@@ -669,6 +690,39 @@ def cli_lock(settings: Settings):
         fd.close()
 
 
+def tail_text(text: str | bytes | None, *, max_lines: int = OUTPUT_TAIL_LINES, max_chars: int = OUTPUT_TAIL_CHARS) -> str:
+    """Last max_lines lines of text, further clipped to max_chars, with a marker when clipped."""
+    if not text:
+        return ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    lines = text.strip().splitlines()
+    if not lines:
+        return ""
+    clipped = len(lines) > max_lines
+    tail = "\n".join(lines[-max_lines:])
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+        clipped = True
+    return (f"... (truncated, showing last {max_lines} lines)\n{tail}" if clipped else tail)
+
+
+def format_command_output(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
+    """Both streams, each tailed and labeled.
+
+    A failing `cmake --build` writes its warnings to stderr and the actual ninja/compiler
+    error to stdout, so reporting only one stream (as this used to) hides the real cause.
+    The streams are captured through separate pipes, so their true interleaving is already
+    gone; labeled sections are the most faithful bounded rendering available.
+    """
+    sections = []
+    for label, stream in (("stdout", stdout), ("stderr", stderr)):
+        tail = tail_text(stream)
+        if tail:
+            sections.append(f"--- {label} (tail) ---\n{tail}")
+    return "\n".join(sections)
+
+
 def run(
     argv: list[str],
     *,
@@ -677,6 +731,7 @@ def run(
     capture_output: bool = True,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    command = " ".join(shlex.quote(part) for part in argv)
     try:
         result = subprocess.run(
             argv,
@@ -687,14 +742,15 @@ def run(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        command = " ".join(shlex.quote(part) for part in argv)
-        raise WingpuError(f"Command timed out after {timeout:g}s: {command}") from exc
+        detail = format_command_output(exc.stdout, exc.stderr)
+        message = f"Command timed out after {timeout:g}s: {command}"
+        raise WingpuError(f"{message}\n{detail}" if detail else message) from exc
     if check and result.returncode != 0:
-        command = " ".join(shlex.quote(part) for part in argv)
-        stderr = result.stderr.strip()
-        stdout = result.stdout.strip()
-        detail = stderr or stdout or f"exit code {result.returncode}"
-        raise WingpuError(f"Command failed: {command}\n{detail}")
+        detail = format_command_output(result.stdout, result.stderr)
+        message = f"Command failed (exit code {result.returncode}): {command}"
+        if not detail:
+            detail = "(no output captured)" if capture_output else "(output was not captured)"
+        raise WingpuError(f"{message}\n{detail}")
     return result
 
 
@@ -780,6 +836,34 @@ def backend_api_json(settings: Settings, path: str) -> dict[str, Any]:
         return json.load(response)
 
 
+def validate_reasoning_effort(value: str) -> None:
+    """Fail at config load rather than on every later chat request.
+
+    An unsupported level is not rejected by llama-server; it is forwarded to the chat
+    template as a kwarg, and a template that does not know the level raises, which the
+    server returns as HTTP 500 for every single completion. That is an expensive way to
+    discover a typo, so the known levels are checked up front.
+    """
+    if not value or value in REASONING_EFFORT_LEVELS:
+        return
+    rendered = ", ".join(REASONING_EFFORT_LEVELS)
+    raise WingpuError(
+        f"runtime_defaults.reasoning_effort: unsupported value {value!r}. "
+        f"Use one of: {rendered}, or \"\" to leave the flag off. "
+        "Note that the model's chat template may accept only a subset (Qwen3.8: xhigh, medium, low)."
+    )
+
+
+def reasoning_server_args(defaults: RuntimeDefaults) -> list[str]:
+    """llama-server reasoning flags implied by [runtime_defaults], omitted when unset."""
+    args: list[str] = []
+    if defaults.reasoning_effort:
+        args += ["--reasoning-effort", defaults.reasoning_effort]
+    if defaults.reasoning_budget is not None and defaults.reasoning_budget >= 0:
+        args += ["--reasoning-budget", str(defaults.reasoning_budget)]
+    return args
+
+
 def validate_extra_server_args(args: list[str], *, source_label: str) -> None:
     managed_flags = {
         "-m",
@@ -801,6 +885,8 @@ def validate_extra_server_args(args: list[str], *, source_label: str) -> None:
         "-fa",
         "--flash-attn",
         "--jinja",
+        "--reasoning-effort",
+        "--reasoning-budget",
     }
     conflicting = [arg for arg in args if arg in managed_flags]
     if conflicting:
@@ -1095,7 +1181,13 @@ def start_remote_runtime(
     lane = runtime_lane(settings, runtime_id)
     model_entry = catalog_entry(settings, model_name)
     model_path = remote_model_path(settings, model_name)
-    extra_args = settings.runtime_defaults.extra_server_args + lane.extra_server_args
+    # Reasoning flags are config-driven (and rejected in extra_server_args by
+    # validate_extra_server_args), so they lead and nothing downstream repeats them.
+    extra_args = (
+        reasoning_server_args(settings.runtime_defaults)
+        + settings.runtime_defaults.extra_server_args
+        + lane.extra_server_args
+    )
     extra_args_str = " ".join(shlex.quote(arg) for arg in extra_args)
     pid_file = remote_runtime_pid_file(settings, runtime_id)
     log_file = remote_runtime_log_file(settings, runtime_id)
