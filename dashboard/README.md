@@ -30,8 +30,39 @@ gpu-dashboard
 `--project-dir` points at a checkout that contains `config/qwen_gguf_catalog.json` when the
 dashboard is installed outside the repo. From a source tree it finds that file by walking parents.
 
-The page is static HTML, CSS, and JS served by the Python process. There is no Node build.
-Dark is the default. Light is the header toggle, or `?theme=light`.
+The Python process serves the built page from `src/gpu_dashboard/static`. Running the dashboard
+does not need Node. Dark is the default. Light is the header toggle, or `?theme=light`. The choice
+is stored in `localStorage` under `gpu-dashboard-theme`.
+
+## Frontend
+
+The UI is a React app in `dashboard/web` (Vite, Tailwind, shadcn/ui). Rebuild it, from the repo
+root, with:
+
+```bash
+cd dashboard/web && npm install && npm run build
+```
+
+That writes `dashboard/src/gpu_dashboard/static`, which is the tree the Python server already
+serves. The build is committed, so a checkout can run the page without Node. Fonts, CSS, and
+JavaScript are local files. Nothing is loaded from a CDN.
+
+## Design
+
+The layout follows the shadcn dashboard: a collapsible sidebar, overview cards, a workload table,
+an event table, and log tabs. Cards use a 1px ring and no drop shadow. Radius is 8px. Spacing
+steps are 4px and 8px. The typeface is Geist, with Geist Mono for times, process ids, and logs.
+Figures use tabular numerals.
+
+Colour stays neutral. The primary button is near-black in light mode and near-white in dark mode.
+Emerald, amber, and red appear only on status (alive, busy, VRAM at or above 92%, destructive
+actions). Motion is limited to colour transitions of about 150ms.
+
+References: [Vercel Geist](https://vercel.com/geist) and the [Geist font](https://github.com/vercel/geist-font)
+(the webfonts under `dashboard/web/src/fonts`, SIL OFL), the [shadcn/ui](https://ui.shadcn.com)
+dashboard and sidebar blocks, [Tremor](https://tremor.so) for status colour on metrics, and the
+dense neutral consoles of Linear, Railway, Fly.io, and Tailscale. When mock mode is on, the header
+badge and the line under it say the numbers are example data.
 
 ## launchd
 

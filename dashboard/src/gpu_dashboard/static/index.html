@@ -1,53 +1,26 @@
-<!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>GPU Bridge</title>
-  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/app.css">
-  <script>
-    (function () {
-      var query = new URLSearchParams(location.search).get("theme");
-      var stored = localStorage.getItem("gpu-dashboard-theme");
-      var theme = query || stored || "dark";
-      if (theme !== "light" && theme !== "dark") theme = "dark";
-      document.documentElement.setAttribute("data-theme", theme);
-    })();
-  </script>
-</head>
-<body>
-  <header class="top">
-    <div class="brand">
-      <span class="mark" aria-hidden="true"><i></i><i></i></span>
-      <div>
-        <h1>GPU Bridge</h1>
-        <p class="sub">Operations console · loopback only</p>
-      </div>
-    </div>
-    <div class="top-meta">
-      <span id="sample" class="chip chip-quiet" hidden>Sample data</span>
-      <span id="host-chip" class="chip">win-gpu</span>
-      <time id="clock" datetime=""></time>
-      <button id="theme" class="btn btn-ghost" type="button">Light</button>
-    </div>
-  </header>
-
-  <main class="layout">
-    <aside class="rail">
-      <section class="card" id="gpu-card" aria-labelledby="gpu-title"></section>
-      <section class="card" id="lease-card" aria-labelledby="lease-title"></section>
-      <section class="card" id="idle-card" aria-labelledby="idle-title"></section>
-      <section class="card" id="events-card" aria-labelledby="events-title"></section>
-    </aside>
-    <div class="stage">
-      <section class="card card-hero" id="llama-card" aria-labelledby="llama-title"></section>
-      <div class="grid-2" id="service-grid"></div>
-      <section class="card" id="log-card" aria-labelledby="log-title"></section>
-    </div>
-  </main>
-
-  <p id="toast" class="toast" role="status" hidden></p>
-  <script src="/static/app.js"></script>
-</body>
+<!doctype html>
+<html lang="en" class="dark" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GPU Bridge</title>
+    <script>
+      (function () {
+        var query = new URLSearchParams(location.search).get("theme");
+        var stored = localStorage.getItem("gpu-dashboard-theme");
+        var theme = query || stored || "dark";
+        if (theme !== "light" && theme !== "dark") theme = "dark";
+        var root = document.documentElement;
+        root.setAttribute("data-theme", theme);
+        root.classList.toggle("dark", theme === "dark");
+        root.style.colorScheme = theme;
+      })();
+    </script>
+    <script type="module" crossorigin src="/static/assets/index-C27TJA_6.js"></script>
+    <link rel="stylesheet" crossorigin href="/static/assets/index-m0-a2apY.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
 </html>

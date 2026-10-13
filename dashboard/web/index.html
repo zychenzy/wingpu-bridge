@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en" class="dark" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GPU Bridge</title>
+    <script>
+      (function () {
+        var query = new URLSearchParams(location.search).get("theme");
+        var stored = localStorage.getItem("gpu-dashboard-theme");
+        var theme = query || stored || "dark";
+        if (theme !== "light" && theme !== "dark") theme = "dark";
+        var root = document.documentElement;
+        root.setAttribute("data-theme", theme);
+        root.classList.toggle("dark", theme === "dark");
+        root.style.colorScheme = theme;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
