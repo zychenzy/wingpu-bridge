@@ -1,0 +1,22 @@
+[project]
+name = "gpu-dashboard"
+version = "1.0.0"
+description = "Local loopback operations console for the wingpu GPU broker"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+gpu-dashboard = "gpu_dashboard.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpu_dashboard"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/gpu_dashboard/static" = "gpu_dashboard/static"
+
+[tool.uv]
+package = true
