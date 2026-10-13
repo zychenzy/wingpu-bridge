@@ -360,9 +360,14 @@ llama.cpp), plus `locatectl`, `ocrctl`, and `minerctl` in the neighboring repos.
 model that does not fit in VRAM alongside the others, but historically nothing coordinated them,
 so two loaded at once meant an out-of-memory failure or an orphaned process pinning VRAM.
 
-`wsl/gpu_broker.py` is the single authority on who holds the GPU. It is daemonless: state lives in
-SQLite (`~/.gpu-bridge/broker.db`) guarded by an flock, and every command is a short-lived process.
-There is no service to keep alive.
+The broker program lives in the `gpubroker` package (`gpubroker/src/gpubroker/broker.py`).
+`wsl/gpu_broker.py` is only a development shim that runs that file. wingpu is the only CLI that
+uploads it to WSL (`wingpu broker install`). Sibling CLIs depend on the package and do not upload
+their own copy. See [the migration guide](gpubroker-migration.md).
+
+It is daemonless: state lives in SQLite (`~/.gpu-bridge/broker.db`) guarded by an flock, and every
+command is a short-lived process. There is no broker service to keep alive. The event log is a ring
+of 500 rows. `wingpu broker version` prints the installed version so a client can see a mismatch.
 
 ### How wingpu uses it
 
@@ -370,9 +375,19 @@ There is no service to keep alive.
   broker evicts it (graceful POST shutdown if the runtime offers one, otherwise SIGTERM then
   SIGKILL on its pidfile) and waits for VRAM to actually drain (`nvidia-smi`) before granting.
 - On idle-offload and on `wingpu stop`, wingpu calls `release`, so the holder is cleared.
-- "Busy" is judged from real GPU utilization, so an actively running generation is not killed.
-  If the holder is busy, `acquire` waits up to `broker.acquire_wait_seconds`, then fails the start
+- "Busy" is a recent `touch`, or this holder's own process using the GPU. Whole-card utilization
+  is only a fallback when nvidia-smi cannot attribute the work and this holder is the only compute
+  process. The gateway calls `touch` while a request is in flight (at most once per
+  `touch_interval_seconds`), so an in-use llama is not treated as idle. A touch is not sent on a
+  timer for the life of the process, or idle offload would never fire.
+- If the holder is busy, `acquire` waits up to `broker.acquire_wait_seconds`, then fails the start
   with a clear message. Use `wingpu start --force-gpu` to preempt a busy holder immediately.
+- Eviction POSTs the holder's `shutdown_url` before SIGTERM. wingpu starts a small loopback helper
+  next to llama (`shutdown_port`, default 8799) so a later eviction can ask llama to stop cleanly.
+- A fast path that finds llama already running reasserts the lease with `--no-evict`. It takes a
+  free card, and it does not kill a sibling that currently holds one.
+- The long kill-grace and VRAM-drain waits run outside the broker lock. The holder row is marked
+  `draining` so a second acquire does not grant the card during that wait.
 
 This is fail-open: if the broker is unreachable or not yet installed, wingpu prints a warning and
 starts anyway, so a broker problem never blocks normal use. Set `broker.enabled = false` to opt out
@@ -381,12 +396,15 @@ entirely.
 ### Commands
 
 ```bash
-wingpu broker status            # who holds the GPU, VRAM use, watchdog state
+wingpu broker status            # holder, VRAM, per-process VRAM, version, next idle eviction
 wingpu broker status --json     # same, machine-readable
-wingpu broker install           # upload/refresh gpu_broker.py on the WSL host
+wingpu broker version           # {"version", "protocol"} of the copy on WSL
+wingpu broker events            # recent lease events (ring buffer, also --json --limit --since)
+wingpu broker install           # upload/refresh the broker and the shutdown helper on WSL
 wingpu broker evict             # manually free the GPU (evict the current holder)
 wingpu broker watchdog start    # start the idle-eviction loop (see below)
 wingpu broker watchdog stop
+wingpu logs --source llama      # llama, gateway, or watchdog. Paths are fixed, not an argument
 ```
 
 `wingpu status` also shows a "GPU broker" block (holder, VRAM, watchdog).
@@ -415,20 +433,28 @@ wingpu broker watchdog stop
 | `vram_floor_mb` | `2000` | VRAM (MB) at/below which the card counts as freed after an eviction. |
 | `free_timeout_seconds` | `60` | Max wait for VRAM to drain after evicting a holder. |
 | `acquire_wait_seconds` | `30` | Wait this long for a busy holder to go idle before failing (use `--force-gpu` to skip). |
-| `busy_util_pct` | `15` | GPU utilization at/above which the holder counts as busy. |
-| `watchdog_idle_timeout_seconds` | `900` | Watchdog evicts a holder idle this long. |
+| `busy_util_pct` | `15` | Fallback utilization at/above which a sole compute process counts as busy. |
+| `stale_grace_seconds` | `45` | A dead holder younger than this is left alone unless acquire is forced. |
+| `touch_interval_seconds` | `30` | Minimum gap between gateway lease touches while requests are in flight. |
+| `shutdown_port` | `8799` | WSL loopback port of the llama shutdown helper. `0` disables the URL. |
+| `watchdog_idle_timeout_seconds` | `2100` | Shipped default. The code fallback, if the key is omitted, is 900. Must stay at or above `gateway.idle_timeout_seconds`. |
 | `watchdog_poll_seconds` | `15` | Watchdog poll interval. |
 
 ### State on the WSL host
 
 ```text
 ~/.gpu-bridge/
-  gpu_broker.py          uploaded broker program
-  broker.db              SQLite: current holder + event log
+  gpu_broker.py          broker uploaded by wingpu (the gpubroker package file)
+  shutdown_helper.py     loopback helper wingpu starts with llama
+  broker.db              SQLite: current holder + capped event log
   broker.lock            flock for mutual exclusion
   run/watchdog.pid       watchdog pid (when running)
+  run/watchdog.json      idle timeout and drain settings the watchdog was started with
   logs/watchdog.log      watchdog output
 ```
+
+`wsl/install.sh` still installs the older Docker job queue (`bridge_ctl` / `worker`). That queue
+is not broker-aware. It does not install the GPU broker.
 
 ### Troubleshooting
 
@@ -436,4 +462,27 @@ wingpu broker watchdog stop
   that bridge, or run `wingpu start --force-gpu`.
 - Stuck holder after a crash: `wingpu broker status` shows `alive=false`; the next `acquire`
   (or `wingpu broker evict`) clears it.
-- To see the raw event log on the host: `sqlite3 ~/.gpu-bridge/broker.db 'select * from events order by id desc limit 20'`.
+- Recent history: `wingpu broker events`. The table keeps the latest 500 rows.
+- Siblings should follow [gpubroker-migration.md](gpubroker-migration.md). Whisper and the Qwen ASR
+  server need different runtime ids (`live-asr` and `live-asr-qwen`). OCR and transcription should
+  use `gpubroker.ssh.serve_tcp_relay` instead of `ssh -L`, which Windows drops after about 15 seconds.
+
+## 12. GPU dashboard
+
+`dashboard/` is a local operations page for this machine. It binds to `127.0.0.1:18081` only and
+refuses any other address. Buttons call an allowlist (`wingpu`, `ocrctl`, `locatectl`,
+`remote-asr`, `minerctl`). There is no shell and no free-form command.
+
+```bash
+PYTHONPATH=dashboard/src python3 -m gpu_dashboard          # live, needs the CLIs on PATH
+PYTHONPATH=dashboard/src python3 -m gpu_dashboard --mock   # sample data, no SSH
+```
+
+`uv tool install --from ./dashboard gpu-dashboard` installs the `gpu-dashboard` command.
+A launchd template is `dashboard/launchd/com.zychenzy.gpu-dashboard.plist`. An optional container
+recipe is `dashboard/Containerfile`; it still binds loopback inside the container, and it does not
+have the Mac's SSH sockets, so launchd is the useful way to run it. Details: [dashboard/README.md](../dashboard/README.md).
+
+The page shows GPU and per-process VRAM, the lease, the next idle-eviction time, llama model and
+lane switching from `config/qwen_gguf_catalog.json`, and start/stop for OCR, LocateAnything,
+transcription, and MinerU, plus logs. Evict asks for a second click.

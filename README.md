@@ -175,21 +175,27 @@ budget of `0` is a no-op and full thinking still happens. Only `N > 0` is enforc
 
 ## Shared GPU Broker
 
-The Windows host has one GPU shared by this bridge and its siblings. `wsl/gpu_broker.py` is a
-daemonless lease arbiter (SQLite + flock on the WSL host) that lets only one runtime hold the GPU
-at a time. Before starting `llama-server`, wingpu acquires the GPU, evicting whatever holds it and
-waiting for VRAM to drain; it releases on idle-offload and `stop`. A busy holder (judged from GPU
-utilization) is not killed unless you pass `--force-gpu`.
+The Windows host has one GPU shared by this bridge and its siblings. The lease arbiter is the
+`gpubroker` package. wingpu uploads that broker to WSL and is the only CLI that should. Before
+starting `llama-server`, wingpu acquires the GPU, evicting whatever holds it and waiting for VRAM
+to drain; it releases on idle-offload and `stop`. The gateway touches the lease while a request is
+in flight, so the idle watchdog does not treat an active chat as idle. A busy holder is not killed
+unless you pass `--force-gpu`.
 
 ```bash
-wingpu broker status            # who holds the GPU, VRAM, watchdog state
-wingpu broker install           # upload/refresh the broker on the WSL host
+wingpu broker status            # holder, VRAM, version, next idle eviction
+wingpu broker install           # upload or upgrade the broker on the WSL host
 wingpu broker evict             # manually free the GPU
 wingpu start --force-gpu        # preempt a busy holder
 ```
 
 It is fail-open (a broker problem never blocks a start) and can be turned off with
-`broker.enabled = false`. Full details: [Project Guide, section 11](docs/README.md).
+`broker.enabled = false`. Sibling repos should depend on `gpubroker` instead of vendoring
+`gpu_broker.py`. Full details: [Project Guide, section 11](docs/README.md) and
+[the migration guide](docs/gpubroker-migration.md).
+
+A loopback operations page lives in `dashboard/` (`gpu-dashboard`, port 18081). See
+[dashboard/README.md](dashboard/README.md).
 
 ## Read This Next
 
@@ -224,7 +230,9 @@ These paths are intentionally kept out of git so the repo can stay publishable w
 
 - `bridge/config/`: publish-safe defaults and model catalog
 - `bridge/docs/`: durable project documentation
+- `bridge/gpubroker/`: shared broker package (broker, client, SSH relay, lease helpers)
+- `bridge/dashboard/`: loopback GPU operations console
 - `bridge/mac/`: Python `wingpu` controller and utilities
 - `bridge/profiles/`: local profile templates
 - `bridge/windows/`: Windows-side setup scripts
-- `bridge/wsl/`: the GPU broker (`gpu_broker.py`) plus older reference utilities
+- `bridge/wsl/`: shim that runs the packaged broker, plus the older Docker queue utilities
