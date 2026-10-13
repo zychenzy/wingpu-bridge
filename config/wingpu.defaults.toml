@@ -21,6 +21,8 @@ server_alive_count_max = 3
 listen_host = "127.0.0.1"
 backend_host = "127.0.0.1"
 backend_local_port = 18000
+# auto: the relay's nc dials 127.0.0.1 inside WSL. Any other value is that
+# address, still dialed from inside WSL. This is not an ssh -L target.
 backend_tunnel_target_host = "auto"
 idle_offload_enabled = true
 idle_timeout_seconds = 1800
@@ -123,6 +125,13 @@ busy_util_pct = 15
 # watchdog is off by default, so this only matters once it is started explicitly.
 watchdog_idle_timeout_seconds = 2100
 watchdog_poll_seconds = 15
+# A dead holder younger than this is left alone unless acquire is forced.
+stale_grace_seconds = 45
+# How often the gateway reports activity while a request is in flight.
+# Touches happen on real requests, not on a timer for the life of the process.
+touch_interval_seconds = 30
+# WSL loopback port of the graceful-shutdown helper started with llama. 0 disables it.
+shutdown_port = 8799
 
 [state]
 state_dir = "~/.gpu-chat-bridge"

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Installs the legacy Docker job queue (bridge_ctl / worker) only.
+# The GPU lease broker is installed by `wingpu broker install`, which uploads
+# the gpubroker package's broker.py. This script does not deploy the broker.
 set -euo pipefail
 
 PREFIX="${1:-$HOME/.gpu-bridge}"
