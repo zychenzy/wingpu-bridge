@@ -1,11 +1,14 @@
 """Tests for the wingpu <-> GPU broker wiring in wingpu_cli.main and the
 shared gpubroker client."""
 import io
+import subprocess
 import unittest
 from unittest import mock
 
 import gpubroker.client as bc
 import wingpu_cli.main as main
+from gpubroker.broker import PROTOCOL, VERSION
+from gpubroker.ssh import bash_s_payload
 
 
 def _settings(broker_enabled=True):
@@ -149,6 +152,80 @@ class BrokerClientTests(unittest.TestCase):
         self.assertEqual(payload, b"print('hi')\n")
         self.assertIn("gpu_broker.py", upload_script)
         self.assertNotIn("base64", upload_script)
+
+    def test_broker_runner_upload_is_cmd_safe(self):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["input"] = kwargs.get("input_text")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        body = b"print('hi')\n"
+        script = (
+            "mkdir -p /home/czy/.gpu-bridge && "
+            "cat > /home/czy/.gpu-bridge/gpu_broker.py && "
+            "chmod 755 /home/czy/.gpu-bridge/gpu_broker.py"
+        )
+        with mock.patch.object(main, "run", side_effect=fake_run):
+            rc, out, err = main.broker_runner(_settings())(script, stdin=body, timeout=5)
+        self.assertEqual((rc, out, err), (0, "", ""))
+        remote = captured["argv"][-1]
+        self.assertEqual(remote, "wsl -d Ubuntu -- env COLUMNS=120 LINES=40 bash -seuo pipefail")
+        self.assertNotIn("bash -c", remote)
+        self.assertNotIn("&&", remote)
+        self.assertNotIn("'", remote)
+        self.assertNotIn("print('hi')", remote)
+        self.assertNotIn(body.decode(), " ".join(captured["argv"]))
+        self.assertEqual(captured["input"].encode(), bash_s_payload(script, body))
+
+    def test_ensure_broker_installed_includes_write_stderr(self):
+        def runner(script, *, timeout=None, stdin=None):
+            if stdin is not None:
+                return 2, "", "/bin/bash: -c: line 1: unexpected EOF while looking for matching `'"
+            if "test -f" in script:
+                return 0, "missing\n", ""
+            raise AssertionError(script)
+
+        with mock.patch.object(main, "broker_runner", return_value=runner):
+            with self.assertRaises(main.WingpuError) as caught:
+                main.ensure_broker_installed(_settings())
+        message = str(caught.exception)
+        self.assertIn("Failed to install the GPU broker at /home/czy/.gpu-bridge", message)
+        self.assertIn("exit 2", message)
+        self.assertIn("unexpected EOF while looking for matching", message)
+
+    def test_ensure_broker_installed_accepts_runner_stderr_tuple(self):
+        def runner(script, *, timeout=None, stdin=None):
+            if "shutdown_helper.py" in script and "test -f" in script:
+                return 0, "present\n", ""
+            if "test -f" in script:
+                return 0, "present\n", ""
+            if "version" in script:
+                return 0, '{"version": "%s", "protocol": %s}\n' % (VERSION, PROTOCOL), ""
+            raise AssertionError(script)
+
+        with mock.patch.object(main, "broker_runner", return_value=runner):
+            main.ensure_broker_installed(_settings())
+
+    def test_broker_install_command_prints_remote_stderr(self):
+        exc = bc.InstallError(
+            "/home/czy/.gpu-bridge",
+            stage="upload gpu_broker.py",
+            returncode=2,
+            detail="/bin/bash: -c: line 1: unexpected EOF while looking for matching `'",
+        )
+        err = io.StringIO()
+        with mock.patch.object(main, "load_settings", return_value=_settings()), \
+             mock.patch.object(main.broker_client, "install", side_effect=exc), \
+             mock.patch("sys.stderr", err):
+            rc = main.main(["broker", "install"])
+        self.assertEqual(rc, 1)
+        text = err.getvalue()
+        self.assertIn("exit 2", text)
+        self.assertIn("unexpected EOF while looking for matching", text)
+        self.assertIn("/home/czy/.gpu-bridge", text)
+        self.assertNotEqual(text.strip(), "Failed to install the GPU broker at /home/czy/.gpu-bridge.")
 
 
 class FastPathAndTouchTests(unittest.TestCase):

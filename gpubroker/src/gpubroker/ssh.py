@@ -5,8 +5,13 @@ properties matter:
 
 * ``timeout`` is passed to the process. A hung SSH session ends with return
   code 124 instead of blocking the CLI forever.
-* File uploads travel on stdin (see ``write_file``). The remote command stays
-  small, so it survives Windows' 32,767-character ``CreateProcess`` limit.
+* File uploads travel on stdin (see ``write_file``). The SSH argv stays small
+  and free of cmd.exe metacharacters. Windows OpenSSH runs that argv with
+  cmd.exe, which does not treat single quotes as quoting, so ``bash -c
+  '<script>'`` is split on ``&&`` and ``>`` before WSL starts (bash then
+  exits 2: ``unexpected EOF while looking for matching '``). The file body
+  is base64 inside the ``bash -s`` program, never on the SSH argv, which
+  also keeps it under Windows' 32,767-character ``CreateProcess`` limit.
 
 ``serve_tcp_relay`` is the transport wingpu uses instead of ``ssh -L``. TCP
 into WSL over the Hyper-V NAT is reset after about 15 seconds even while the
@@ -16,6 +21,7 @@ avoids that hop. OCR and live transcription should use this instead of
 """
 from __future__ import annotations
 
+import base64
 import os
 import shlex
 import signal
@@ -105,26 +111,55 @@ def run_argv(argv: Sequence[str], *, input_bytes: bytes | None = None,
     )
 
 
+# Marker for the upload heredoc. Standard base64 never contains this text.
+_STDIN_B64_MARK = "GPUBROKER_B64_EOF"
+
+
+def wsl_shell_command(distro: str) -> str:
+    """Remote command that runs ``bash -s`` inside the WSL distro.
+
+    The command is the same one used for ordinary scripts. It has no
+    single quotes and no cmd.exe operators, so Windows OpenSSH can hand it
+    to cmd.exe without splitting it.
+    """
+    return (
+        f"wsl -d {shlex.quote(distro)} -- "
+        "env COLUMNS=120 LINES=40 bash -seuo pipefail"
+    )
+
+
+def bash_s_payload(script: str, stdin: bytes | None = None) -> bytes:
+    """Bytes to feed ``bash -s``.
+
+    With ``stdin`` unset, ``script`` is the program. With ``stdin`` set, the
+    program decodes those bytes and runs ``script`` with them on its standard
+    input. The file body is not placed on the SSH argv.
+    """
+    if stdin is None:
+        return script.encode("utf-8")
+    encoded = base64.b64encode(stdin).decode("ascii")
+    quoted = shlex.quote(script)
+    wrapper = (
+        "payload=$(mktemp)\n"
+        "trap 'rm -f -- \"$payload\"' EXIT\n"
+        f"base64 -d > \"$payload\" << '{_STDIN_B64_MARK}'\n"
+        f"{encoded}\n"
+        f"{_STDIN_B64_MARK}\n"
+        f"bash -c {quoted} < \"$payload\"\n"
+    )
+    return wrapper.encode("utf-8")
+
+
 def run_wsl_script(target: SshTarget, script: str, *, timeout: float | None = None,
                    stdin: bytes | None = None, check: bool = False) -> RunResult:
     """Run bash inside the WSL distro on ``target.host``.
 
-    With ``stdin`` unset, ``script`` is delivered on SSH's stdin (``bash -s``),
-    so it may be large. With ``stdin`` set, ``script`` is the remote ``bash -c``
-    argument and must stay short; ``stdin`` is the process input (a file body).
+    ``script`` is always delivered on SSH's stdin (``bash -s``), so the SSH
+    argv does not depend on quoting inside ``script``. When ``stdin`` is set
+    it is the input of ``script`` (a file body); see ``bash_s_payload``.
     """
-    if stdin is None:
-        remote = (
-            f"wsl -d {shlex.quote(target.distro)} -- "
-            "env COLUMNS=120 LINES=40 bash -seuo pipefail"
-        )
-        payload = script.encode("utf-8")
-    else:
-        remote = (
-            f"wsl -d {shlex.quote(target.distro)} -- "
-            f"env COLUMNS=120 LINES=40 bash -c {shlex.quote(script)}"
-        )
-        payload = stdin
+    remote = wsl_shell_command(target.distro)
+    payload = bash_s_payload(script, stdin)
     argv = ["ssh", *ssh_option_args(target), target.host, remote]
     result = run_argv(argv, input_bytes=payload, timeout=timeout)
     if check and result.returncode != 0:
@@ -134,11 +169,21 @@ def run_wsl_script(target: SshTarget, script: str, *, timeout: float | None = No
 
 
 def runner_for(target: SshTarget):
-    """Adapt ``run_wsl_script`` to the ``gpubroker.client`` runner signature."""
+    """Adapt ``run_wsl_script`` to the ``gpubroker.client`` runner signature.
+
+    Returns ``(returncode, stdout)``. A failed upload (``stdin`` set) folds
+    stderr into that text so ``install`` can quote the remote error. Callers
+    that need the streams separate should use ``run_wsl_script``.
+    """
 
     def _runner(script: str, *, timeout: float | None = None, stdin: bytes | None = None):
         result = run_wsl_script(target, script, timeout=timeout, stdin=stdin)
-        return result.returncode, result.stdout
+        text = result.stdout or ""
+        if stdin is not None and result.returncode != 0:
+            err = (result.stderr or "").strip()
+            if err and err not in text:
+                text = f"{text}\n{err}" if text.strip() else err
+        return result.returncode, text
 
     return _runner
 
