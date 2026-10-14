@@ -27,7 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from . import broker_client
+from gpubroker import client as broker_client
+from gpubroker import lease as broker_lease
 
 
 BRIDGE_DIR = Path(__file__).resolve().parents[3]
@@ -110,6 +111,9 @@ class GatewayConfig:
     listen_host: str = "127.0.0.1"
     backend_host: str = "127.0.0.1"
     backend_local_port: int = 18000
+    # Where the ssh-stdio relay's WSL-side `nc` connects. "auto" is 127.0.0.1
+    # inside WSL (no Hyper-V NAT hop). Any other value is that host, still dialed
+    # from inside WSL, not an `ssh -L` target.
     backend_tunnel_target_host: str = "auto"
     idle_offload_enabled: bool = True
     idle_timeout_seconds: int = 1800
@@ -133,6 +137,11 @@ class BrokerConfig:
     busy_util_pct: int = 15          # GPU util%% considered busy
     watchdog_idle_timeout_seconds: int = 900
     watchdog_poll_seconds: int = 15
+    stale_grace_seconds: float = 45
+    # Gateway touches the lease at most this often while requests are in flight.
+    touch_interval_seconds: float = 30
+    # WSL loopback port of the graceful-shutdown helper. 0 disables the URL.
+    shutdown_port: int = 8799
 
 
 @dataclass(slots=True)
@@ -933,16 +942,25 @@ def wsl_guest_ip(settings: Settings) -> str:
     raise WingpuError(f"Unable to determine WSL IP address for distro {settings.connection.distro}.")
 
 
+def relay_nc_host(settings: Settings) -> str:
+    """Host `nc` dials inside WSL. `auto` stays on WSL localhost."""
+    raw = (settings.gateway.backend_tunnel_target_host or "auto").strip()
+    if raw.lower() in {"", "auto", "wsl", "localhost"}:
+        return "127.0.0.1"
+    return raw
+
+
 def _relay_backend_command(settings: Settings) -> list[str]:
     """The per-connection ssh command the relay spawns.
 
     Carries the backend byte stream over the ssh channel to a WSL-local `nc`, so the
     connection terminates inside WSL (no Hyper-V NAT hop that dies at ~15s). ssh is
     multiplexed over one persistent ControlMaster so each request is cheap.
+    `gateway.backend_tunnel_target_host` chooses the address `nc` dials inside WSL.
     """
     remote_command = (
         f"wsl -d {shlex.quote(settings.connection.distro)} -- "
-        f"nc 127.0.0.1 {settings.connection.remote_port}"
+        f"nc {shlex.quote(relay_nc_host(settings))} {settings.connection.remote_port}"
     )
     return [
         "ssh",
@@ -1157,10 +1175,17 @@ fi
 '''
         for runtime_id in settings.runtimes
     )
+    helper_pid = f"{remote_runtime_base_dir(settings)}/run/shutdown-helper.pid"
     script = f"""
 mkdir -p {shlex.quote(remote_runtime_base_dir(settings))}/run {shlex.quote(remote_runtime_base_dir(settings))}/logs
 docker rm -f llama-server-qwen >/dev/null 2>&1 || true
 {pid_cleanup}
+HELPER_PID={shlex.quote(helper_pid)}
+if [[ -f "$HELPER_PID" ]]; then
+  HPID="$(cat "$HELPER_PID")"
+  if [[ -n "$HPID" ]]; then kill "$HPID" >/dev/null 2>&1 || true; fi
+  rm -f "$HELPER_PID"
+fi
 pkill -f '/llama-server .*--port {settings.connection.remote_port}' >/dev/null 2>&1 || true
 echo remote_runtime_stopped
 """
@@ -1195,7 +1220,15 @@ def start_remote_runtime(
     cache_type_k_cli = normalize_cache_type(cache_type_k)
     cache_type_v_cli = normalize_cache_type(cache_type_v)
     print(f"[2/4] Starting native llama.cpp runtime '{runtime_id}' in WSL...")
+    helper = ""
+    if settings.broker.enabled and int(settings.broker.shutdown_port or 0) > 0:
+        helper = broker_lease.shutdown_helper_launch(
+            broker_remote_dir(settings),
+            port=int(settings.broker.shutdown_port),
+            pidfile=pid_file,
+        )
     script = f"""
+{helper}
 mkdir -p {shlex.quote(remote_runtime_base_dir(settings))}/run {shlex.quote(remote_runtime_base_dir(settings))}/logs
 SERVER_BIN={shlex.quote(lane.server_bin)}
 MODEL_PATH={shlex.quote(model_path)}
@@ -1308,29 +1341,92 @@ def broker_remote_dir(settings: Settings) -> str:
 
 
 def broker_runner(settings: Settings):
-    """Adapter: run a remote bash snippet, return (returncode, stdout) for broker_client."""
-    def _runner(script: str, *, timeout: float | None = None) -> tuple[int, str]:
-        cp = run_wsl_script(settings, script, check=False, timeout=timeout)
+    """Adapter: run a remote bash snippet, return (returncode, stdout) for the broker client.
+
+    When ``stdin`` is set, the snippet is a short ``bash -c`` script and the bytes
+    are the remote process's stdin (how the broker file is uploaded). Timeouts are
+    enforced by ``run``.
+    """
+    def _runner(script: str, *, timeout: float | None = None, stdin: bytes | None = None) -> tuple[int, str]:
+        if stdin is None:
+            cp = run_wsl_script(settings, script, check=False, timeout=timeout)
+            return cp.returncode, (cp.stdout or "")
+        remote = (
+            f"wsl -d {shlex.quote(settings.connection.distro)} -- "
+            f"env COLUMNS=120 LINES=40 bash -c {shlex.quote(script)}"
+        )
+        text = stdin.decode("utf-8") if isinstance(stdin, bytes) else stdin
+        cp = run(ssh_base_args(settings) + [remote], input_text=text, check=False, timeout=timeout)
         return cp.returncode, (cp.stdout or "")
     return _runner
 
 
 def broker_script_bytes() -> bytes:
     try:
-        return importlib_resources.files("wingpu_cli.resources").joinpath("gpu_broker.py").read_bytes()
-    except Exception:
-        candidate = BRIDGE_DIR / "wsl" / "gpu_broker.py"
-        if candidate.exists():
-            return candidate.read_bytes()
-    raise WingpuError("Bundled gpu_broker.py not found; reinstall wingpu.")
+        return broker_client.bundled_script_bytes()
+    except Exception as exc:
+        raise WingpuError(f"Bundled gpu broker not found; reinstall wingpu. ({exc})") from exc
+
+
+def llama_shutdown_url(settings: Settings) -> str | None:
+    port = int(settings.broker.shutdown_port or 0)
+    if not settings.broker.enabled or port <= 0:
+        return None
+    return f"http://127.0.0.1:{port}/shutdown"
 
 
 def ensure_broker_installed(settings: Settings) -> None:
+    """Upload or upgrade the WSL broker. wingpu is the only installer."""
     runner = broker_runner(settings)
     remote_dir = broker_remote_dir(settings)
-    if broker_client.is_installed(runner, remote_dir):
+    status = broker_client.ensure_installed(runner, remote_dir, broker_script_bytes(), upgrade=True)
+    if status == "failed":
+        raise WingpuError(f"Failed to install the GPU broker at {remote_dir}.")
+    if status in {"installed", "upgraded"} or not _shutdown_helper_present(runner, remote_dir):
+        broker_client.install_shutdown_helper(
+            runner, remote_dir, broker_client.bundled_shutdown_helper_bytes(),
+        )
+
+
+def _shutdown_helper_present(runner, remote_dir: str) -> bool:
+    script = f"test -f {shlex.quote(remote_dir)}/shutdown_helper.py && echo present || echo missing"
+    try:
+        _rc, out = runner(script, timeout=20)
+    except Exception:
+        return False
+    return "present" in (out or "")
+
+
+def ensure_shutdown_helper(settings: Settings, runtime_id: str) -> None:
+    """Start the loopback helper that the broker POSTs before it signals llama."""
+    if llama_shutdown_url(settings) is None:
         return
-    broker_client.install(runner, remote_dir, broker_script_bytes())
+    try:
+        ensure_broker_installed(settings)
+        snippet = broker_lease.shutdown_helper_launch(
+            broker_remote_dir(settings),
+            port=int(settings.broker.shutdown_port),
+            pidfile=remote_runtime_pid_file(settings, runtime_id),
+        )
+        run_wsl_script(settings, snippet, check=False, timeout=20)
+    except Exception as exc:
+        print(f"[wingpu] warning: shutdown helper not started ({exc})", file=sys.stderr)
+
+
+def touch_gpu_lease(settings: Settings) -> bool:
+    """Tell the broker this bridge is in the middle of a request. Failures are ignored."""
+    if not settings.broker.enabled:
+        return False
+    try:
+        result = broker_client.touch(
+            broker_runner(settings),
+            remote_dir=broker_remote_dir(settings),
+            runtime=settings.broker.runtime_id,
+            timeout=15,
+        )
+    except Exception:
+        return False
+    return bool(result and result.get("touched"))
 
 
 def llama_vram_estimate_mb(settings: Settings, model_name: str) -> int | None:
@@ -1362,6 +1458,8 @@ def acquire_gpu_lease(settings: Settings, model_name: str, runtime_id: str, *, f
             wait=settings.broker.acquire_wait_seconds, force=force,
             busy_util=settings.broker.busy_util_pct, vram_floor=settings.broker.vram_floor_mb,
             free_timeout=settings.broker.free_timeout_seconds,
+            stale_grace=settings.broker.stale_grace_seconds,
+            shutdown_url=llama_shutdown_url(settings),
         )
 
     result = _do()
@@ -1385,6 +1483,47 @@ def acquire_gpu_lease(settings: Settings, model_name: str, runtime_id: str, *, f
     evicted = result.get("evicted")
     if evicted:
         print(f"[wingpu] GPU broker: evicted '{evicted}' to load the llama runtime.")
+
+
+def reassert_gpu_lease(settings: Settings, model_name: str, runtime_id: str) -> None:
+    """If llama is already up, hold the lease when it is free or already ours.
+
+    This does not evict another runtime. A fast path during a chat request must
+    not kill a sibling that is mid-job; it only repairs the case where llama is
+    resident and the broker has no holder (or already lists us).
+    """
+    if not settings.broker.enabled:
+        return
+    try:
+        ensure_broker_installed(settings)
+        result = broker_client.acquire(
+            broker_runner(settings),
+            remote_dir=broker_remote_dir(settings),
+            runtime=settings.broker.runtime_id,
+            pidfile=remote_runtime_pid_file(settings, runtime_id),
+            vram_mb=llama_vram_estimate_mb(settings, model_name),
+            label=f"wingpu:{runtime_id}:{model_name}",
+            wait=0,
+            no_evict=True,
+            busy_util=settings.broker.busy_util_pct,
+            vram_floor=settings.broker.vram_floor_mb,
+            free_timeout=settings.broker.free_timeout_seconds,
+            stale_grace=settings.broker.stale_grace_seconds,
+            shutdown_url=llama_shutdown_url(settings),
+        )
+    except Exception as exc:
+        print(f"[wingpu] warning: could not reassert the GPU lease ({exc})", file=sys.stderr)
+        return
+    if result is None:
+        print("[wingpu] warning: GPU broker did not respond; llama is running without a confirmed lease.",
+              file=sys.stderr)
+        return
+    if not result.get("granted"):
+        print(
+            f"[wingpu] warning: llama is running but the GPU lease is held by "
+            f"{result.get('holder')!r} ({result.get('reason')}).",
+            file=sys.stderr,
+        )
 
 
 def release_gpu_lease(settings: Settings) -> None:
@@ -1431,6 +1570,8 @@ def ensure_runtime_loaded(
     ensure_backend_tunnel(settings)
     if not force_restart and backend_ready_for_fast_path(settings, runtime_id):
         _mark_selected()
+        ensure_shutdown_helper(settings, runtime_id)
+        reassert_gpu_lease(settings, model_name, runtime_id)
         return
 
     process = runtime_process_info(settings, runtime_id)
@@ -1440,6 +1581,8 @@ def ensure_runtime_loaded(
         # reload a healthy 27B (~40s) over a probe blip -- that was the restart storm. A
         # genuinely broken backend surfaces as a proxy error and is recovered there.
         _mark_selected()
+        ensure_shutdown_helper(settings, runtime_id)
+        reassert_gpu_lease(settings, model_name, runtime_id)
         return
 
     if process.get("running"):
@@ -1581,6 +1724,7 @@ class GatewayCoordinator:
         # Set while the runtime is being torn down, so a request racing in cannot take the
         # "recently verified" hot path past a backend that is going away.
         self.offloading = False
+        self._last_broker_touch = 0.0
         # Never probe the remote host here: __init__ runs before the listening socket is
         # bound, so a sleeping Windows box would turn a 20s ssh timeout into "gateway did
         # not become ready". Bind first, probe from probe_runtime_state() afterwards.
@@ -1628,11 +1772,32 @@ class GatewayCoordinator:
         return payload
 
     def begin_request(self) -> None:
+        claim_touch = False
         with self.state_lock:
             self.active_requests += 1
             self.last_request_started_at = time.time()
             self.idle_status = "runtime_loading" if not self.runtime_loaded else "runtime_loaded"
             self.write_state()
+            claim_touch = self._claim_broker_touch_locked()
+        if claim_touch:
+            threading.Thread(target=self._touch_broker_worker, name="wingpu-broker-touch", daemon=True).start()
+
+    def _claim_broker_touch_locked(self) -> bool:
+        """Caller holds state_lock. True at most once per touch interval."""
+        if not self.settings.broker.enabled:
+            return False
+        interval = max(1.0, float(self.settings.broker.touch_interval_seconds))
+        now = time.time()
+        if now - self._last_broker_touch < interval:
+            return False
+        self._last_broker_touch = now
+        return True
+
+    def _touch_broker_worker(self) -> None:
+        if touch_gpu_lease(self.settings):
+            return
+        with self.state_lock:
+            self._last_broker_touch = 0.0
 
     def end_request(self) -> None:
         with self.state_lock:
@@ -2250,7 +2415,13 @@ def print_status(settings: Settings) -> None:
                 print("Holder:   none (GPU is free)")
             if gpu.get("mem_used_mb") is not None:
                 print(f"VRAM:     {gpu.get('mem_used_mb')}/{gpu.get('mem_total_mb')} MB used, util {gpu.get('util_pct')}%")
-            print(f"Watchdog: {'running' if wd.get('running') else 'stopped'}")
+            print(f"Version:  {data.get('version')} (protocol {data.get('protocol')})")
+            if wd.get("running"):
+                nxt = wd.get("next_evict_in_s")
+                extra = f", next eviction in {nxt}s" if nxt is not None else ""
+                print(f"Watchdog: running{extra}")
+            else:
+                print("Watchdog: stopped")
 
 
 def print_models(settings: Settings) -> None:
@@ -2586,7 +2757,70 @@ def cmd_broker_status(settings: Settings, *, as_json: bool = False) -> None:
         print(f"gpu vram   : {gpu.get('mem_used_mb')} / {gpu.get('mem_total_mb')} MB used, util {gpu.get('util_pct')}%")
     else:
         print("gpu vram   : (nvidia-smi unavailable)")
-    print(f"watchdog   : {'running pid ' + str(wd.get('pid')) if wd.get('running') else 'stopped'}")
+    print(f"version    : {data.get('version')} (protocol {data.get('protocol')})")
+    if wd.get("running"):
+        nxt = wd.get("next_evict_in_s")
+        extra = f", next idle evict in {nxt}s" if nxt is not None else ""
+        print(f"watchdog   : running pid {wd.get('pid')}{extra}")
+    else:
+        print("watchdog   : stopped")
+
+
+def cmd_broker_events(settings: Settings, *, as_json: bool = False, limit: int = 50, since: str | None = None) -> None:
+    limit = max(1, min(int(limit), 500))
+    data = broker_client.events(
+        broker_runner(settings),
+        remote_dir=broker_remote_dir(settings),
+        limit=limit,
+        since=since,
+    )
+    if data is None:
+        print("Broker: unreachable or not installed (run: wingpu broker install)")
+        return
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+    rows = data.get("events") or []
+    if not rows:
+        print("(no events)")
+        return
+    for row in rows:
+        runtime = row.get("runtime_id") or ""
+        print(f"{row.get('ts', '')}  {str(row.get('event', '')):<14}  {runtime}")
+
+
+def cmd_broker_version(settings: Settings, *, as_json: bool = False) -> None:
+    data = broker_client.version(broker_runner(settings), broker_remote_dir(settings))
+    if data is None:
+        print("Broker: unreachable or not installed (run: wingpu broker install)")
+        return
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+    print(f"version  : {data.get('version')}")
+    print(f"protocol : {data.get('protocol')}")
+
+
+def cmd_logs(settings: Settings, source: str, tail: int) -> None:
+    """Tail a fixed log. Sources are an allowlist, not a path argument."""
+    tail = max(1, min(int(tail), 1000))
+    if source == "gateway":
+        path = settings.state.gateway_log_path
+        if not path.exists():
+            print(f"(no gateway log at {path})")
+            return
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        print("\n".join(lines[-tail:]))
+        return
+    if source == "watchdog":
+        remote = f"{broker_remote_dir(settings)}/logs/watchdog.log"
+    elif source == "llama":
+        remote = remote_runtime_log_file(settings, selected_runtime(settings))
+    else:
+        raise WingpuError("Unknown log source. Use llama, gateway, or watchdog.")
+    script = f"tail -n {tail} {shlex.quote(remote)} 2>/dev/null || true"
+    completed = run_wsl_script(settings, script, check=False, timeout=20)
+    sys.stdout.write(completed.stdout or "")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2705,11 +2939,21 @@ def build_parser() -> argparse.ArgumentParser:
     broker_subparsers.add_parser("install", help="Upload/refresh gpu_broker.py on the WSL host")
     broker_evict_parser = broker_subparsers.add_parser("evict", help="Evict the current GPU holder")
     broker_evict_parser.add_argument("--runtime", default=None, help="Only evict if this runtime holds the GPU")
+    broker_events_parser = broker_subparsers.add_parser("events", help="Show recent broker events")
+    broker_events_parser.add_argument("--json", action="store_true", help="Emit raw JSON")
+    broker_events_parser.add_argument("--limit", type=int, default=50)
+    broker_events_parser.add_argument("--since", default=None, help="ISO timestamp lower bound")
+    broker_version_parser = broker_subparsers.add_parser("version", help="Show the installed broker version")
+    broker_version_parser.add_argument("--json", action="store_true", help="Emit raw JSON")
     broker_watchdog_parser = broker_subparsers.add_parser("watchdog", help="Manage the idle-eviction watchdog")
     broker_watchdog_subparsers = broker_watchdog_parser.add_subparsers(dest="watchdog_command", required=True)
     broker_watchdog_subparsers.add_parser("start", help="Start the watchdog (idle offload across all bridges)")
     broker_watchdog_subparsers.add_parser("stop", help="Stop the watchdog")
     broker_watchdog_subparsers.add_parser("status", help="Show broker + watchdog status")
+
+    logs_parser = subparsers.add_parser("logs", help="Show llama, gateway, or watchdog logs")
+    logs_parser.add_argument("--source", choices=["llama", "gateway", "watchdog"], default="llama")
+    logs_parser.add_argument("--tail", type=int, default=80)
 
     internal_gateway = subparsers.add_parser("__gateway_serve", help=argparse.SUPPRESS)
     internal_gateway.set_defaults(internal_gateway=True)
@@ -2853,9 +3097,18 @@ def main(argv: list[str] | None = None) -> int:
             if args.broker_command == "status":
                 cmd_broker_status(settings, as_json=args.json)
             elif args.broker_command == "install":
-                # Always refresh (unlike the lazy ensure_broker_installed used on acquire).
-                broker_client.install(broker_runner(settings), broker_remote_dir(settings), broker_script_bytes())
-                print(f"GPU broker installed at {broker_remote_dir(settings)} on {settings.connection.host}.")
+                runner = broker_runner(settings)
+                remote_dir = broker_remote_dir(settings)
+                if not broker_client.install(runner, remote_dir, broker_script_bytes()):
+                    raise WingpuError(f"Failed to install the GPU broker at {remote_dir}.")
+                broker_client.install_shutdown_helper(
+                    runner, remote_dir, broker_client.bundled_shutdown_helper_bytes(),
+                )
+                print(f"GPU broker installed at {remote_dir} on {settings.connection.host}.")
+            elif args.broker_command == "events":
+                cmd_broker_events(settings, as_json=args.json, limit=args.limit, since=args.since)
+            elif args.broker_command == "version":
+                cmd_broker_version(settings, as_json=args.json)
             elif args.broker_command == "evict":
                 data = broker_client.evict(broker_runner(settings),
                                            remote_dir=broker_remote_dir(settings), runtime=args.runtime)
@@ -2868,13 +3121,20 @@ def main(argv: list[str] | None = None) -> int:
                     _rc, out = broker_client.watchdog_start(
                         runner, remote_dir=remote_dir,
                         idle_timeout=settings.broker.watchdog_idle_timeout_seconds,
-                        poll=settings.broker.watchdog_poll_seconds, busy_util=settings.broker.busy_util_pct)
+                        poll=settings.broker.watchdog_poll_seconds,
+                        busy_util=settings.broker.busy_util_pct,
+                        vram_floor=settings.broker.vram_floor_mb,
+                        free_timeout=settings.broker.free_timeout_seconds,
+                        stale_grace=settings.broker.stale_grace_seconds,
+                    )
                     print(out.strip() or "watchdog start issued")
                 elif args.watchdog_command == "stop":
                     _rc, out = broker_client.watchdog_stop(runner, remote_dir=remote_dir)
                     print(out.strip() or "watchdog stop issued")
                 else:
                     cmd_broker_status(settings, as_json=False)
+        elif args.command == "logs":
+            cmd_logs(settings, args.source, args.tail)
         elif args.command == "config":
             if args.config_command == "show":
                 print_config_show(settings)

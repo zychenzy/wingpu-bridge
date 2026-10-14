@@ -1,10 +1,11 @@
 """Tests for the wingpu <-> GPU broker wiring in wingpu_cli.main and the
-standalone broker_client helpers."""
+shared gpubroker client."""
+import io
 import unittest
 from unittest import mock
 
+import gpubroker.client as bc
 import wingpu_cli.main as main
-import wingpu_cli.broker_client as bc
 
 
 def _settings(broker_enabled=True):
@@ -59,6 +60,8 @@ class AcquireLeaseTests(unittest.TestCase):
         self.assertEqual(captured["runtime"], "llama")
         self.assertTrue(captured["force"])
         self.assertEqual(captured["pidfile"], "/home/czy/.gpu-bridge/run/upstream.pid")
+        self.assertEqual(captured["shutdown_url"], "http://127.0.0.1:8799/shutdown")
+        self.assertEqual(captured["stale_grace"], 45)
 
     def test_unreachable_broker_fails_open(self):
         # No JSON from acquire, and install also yields nothing: warn and proceed.
@@ -131,17 +134,108 @@ class BrokerClientTests(unittest.TestCase):
         self.assertTrue(bc.is_installed(lambda s, **k: (0, "present\n"), "/d"))
         self.assertFalse(bc.is_installed(lambda s, **k: (0, "missing\n"), "/d"))
 
-    def test_install_uploads_base64_and_reports(self):
-        seen = {}
+    def test_install_uploads_on_stdin(self):
+        seen = []
 
-        def runner(script, *, timeout=None):
-            seen["script"] = script
-            return 0, "broker_installed\n"
+        def runner(script, *, timeout=None, stdin=None):
+            seen.append((script, stdin))
+            if stdin is not None:
+                return 0, ""
+            return 0, '{"ok": true}\nbroker_installed\n'
 
         ok = bc.install(runner, "/home/czy/.gpu-bridge", b"print('hi')\n")
         self.assertTrue(ok)
-        self.assertIn("base64 -d", seen["script"])
-        self.assertIn("gpu_broker.py", seen["script"])
+        upload_script, payload = seen[0]
+        self.assertEqual(payload, b"print('hi')\n")
+        self.assertIn("gpu_broker.py", upload_script)
+        self.assertNotIn("base64", upload_script)
+
+
+class FastPathAndTouchTests(unittest.TestCase):
+    def test_fast_path_reasserts_lease_without_restart(self):
+        settings = _settings()
+        with mock.patch.object(main, "check_command"), \
+             mock.patch.object(main, "catalog_entry", return_value={"context_length": 4096}), \
+             mock.patch.object(main, "runtime_lane"), \
+             mock.patch.object(main, "supported_cache_types", return_value=["q4_0"]), \
+             mock.patch.object(main, "check_ssh_connectivity"), \
+             mock.patch.object(main, "ensure_backend_tunnel"), \
+             mock.patch.object(main, "backend_ready_for_fast_path", return_value=True), \
+             mock.patch.object(main, "set_selected_model"), \
+             mock.patch.object(main, "set_selected_runtime"), \
+             mock.patch.object(main, "set_selected_cache_type"), \
+             mock.patch.object(main, "ensure_shutdown_helper") as helper, \
+             mock.patch.object(main, "reassert_gpu_lease") as reassert, \
+             mock.patch.object(main, "start_remote_runtime") as start, \
+             mock.patch.object(main, "acquire_gpu_lease") as acquire:
+            main.ensure_runtime_loaded(settings, "Qwen", "upstream", "q4_0", "q4_0", True)
+        helper.assert_called_once()
+        reassert.assert_called_once()
+        start.assert_not_called()
+        acquire.assert_not_called()
+
+    def test_reassert_does_not_evict(self):
+        captured = {}
+
+        def fake_acquire(_runner, **kwargs):
+            captured.update(kwargs)
+            return {"granted": True}
+
+        with mock.patch.object(main, "llama_vram_estimate_mb", return_value=None), \
+             mock.patch.object(main, "ensure_broker_installed"), \
+             mock.patch.object(main.broker_client, "acquire", side_effect=fake_acquire):
+            main.reassert_gpu_lease(_settings(), "Qwen", "upstream")
+        self.assertTrue(captured["no_evict"])
+        self.assertEqual(captured["wait"], 0)
+        self.assertEqual(captured["shutdown_url"], "http://127.0.0.1:8799/shutdown")
+
+    def test_gateway_touches_on_request_and_rate_limits(self):
+        settings = _settings()
+        coord = main.GatewayCoordinator(settings)
+
+        class ImmediateThread:
+            def __init__(self, target=None, name=None, daemon=None):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with mock.patch.object(coord, "write_state"), \
+             mock.patch.object(main, "touch_gpu_lease", return_value=True) as touch, \
+             mock.patch.object(main.threading, "Thread", ImmediateThread):
+            coord.begin_request()
+            coord.begin_request()
+        self.assertEqual(touch.call_count, 1)
+
+    def test_relay_target_comes_from_config(self):
+        settings = _settings()
+        settings.gateway.backend_tunnel_target_host = "auto"
+        self.assertIn("nc 127.0.0.1 8000", main._relay_backend_command(settings)[-1])
+        settings.gateway.backend_tunnel_target_host = "10.1.1.1"
+        self.assertIn("nc 10.1.1.1 8000", main._relay_backend_command(settings)[-1])
+
+    def test_watchdog_start_forwards_drain_options(self):
+        with mock.patch.object(main, "load_settings", return_value=_settings()), \
+             mock.patch.object(main, "ensure_broker_installed"), \
+             mock.patch.object(main.broker_client, "watchdog_start", return_value=(0, "watchdog_started:1")) as start:
+            rc = main.main(["broker", "watchdog", "start"])
+        self.assertEqual(rc, 0)
+        kwargs = start.call_args.kwargs
+        self.assertEqual(kwargs["vram_floor"], 2000)
+        self.assertEqual(kwargs["free_timeout"], 60)
+        self.assertEqual(kwargs["stale_grace"], 45)
+
+    def test_gateway_logs_read_the_local_file(self):
+        settings = _settings()
+        settings.state.state_dir.mkdir(parents=True, exist_ok=True)
+        settings.state.gateway_log_path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            main.cmd_logs(settings, "gateway", 2)
+        text = buf.getvalue()
+        self.assertIn("two", text)
+        self.assertIn("three", text)
+        self.assertNotIn("one", text)
 
 
 if __name__ == "__main__":
