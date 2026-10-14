@@ -110,11 +110,15 @@ class LeaseSession:
 
     def prepare(self) -> str:
         """Install (wingpu only) or report whether the remote broker matches this package."""
-        status = client.ensure_installed(
-            self.runner,
-            self.remote_dir,
-            upgrade=self.allow_install,
-        )
+        try:
+            status = client.ensure_installed(
+                self.runner,
+                self.remote_dir,
+                upgrade=self.allow_install,
+            )
+        except client.InstallError as exc:
+            _warn(f"[gpubroker] {exc}")
+            return "failed"
         if status in {"missing", "mismatch", "failed"} and not self.allow_install:
             _warn(
                 f"[gpubroker] remote broker is {status} at {self.remote_dir}. "

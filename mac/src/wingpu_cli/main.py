@@ -29,6 +29,7 @@ from typing import Any
 
 from gpubroker import client as broker_client
 from gpubroker import lease as broker_lease
+from gpubroker.ssh import bash_s_payload, wsl_shell_command
 
 
 BRIDGE_DIR = Path(__file__).resolve().parents[3]
@@ -814,7 +815,7 @@ def run_wsl_script(
     check: bool = True,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    remote_command = f"wsl -d {shlex.quote(settings.connection.distro)} -- env COLUMNS=120 LINES=40 bash -seuo pipefail"
+    remote_command = wsl_shell_command(settings.connection.distro)
     return run(ssh_base_args(settings) + [remote_command], input_text=script, check=check, timeout=timeout)
 
 
@@ -1341,23 +1342,23 @@ def broker_remote_dir(settings: Settings) -> str:
 
 
 def broker_runner(settings: Settings):
-    """Adapter: run a remote bash snippet, return (returncode, stdout) for the broker client.
+    """Run a remote bash snippet for the broker client.
 
-    When ``stdin`` is set, the snippet is a short ``bash -c`` script and the bytes
-    are the remote process's stdin (how the broker file is uploaded). Timeouts are
-    enforced by ``run``.
+    Returns ``(returncode, stdout, stderr)``. File uploads pass the body as
+    ``stdin``. The SSH command is ``bash -s`` inside WSL, the same command
+    status checks use. The upload snippet is not passed to ``bash -c`` on the
+    SSH argv: Windows OpenSSH runs that argv through cmd.exe, and cmd.exe
+    splits ``&&`` and ``>`` even inside a single-quoted ``bash -c`` argument.
+    The file bytes stay on stdin.
     """
-    def _runner(script: str, *, timeout: float | None = None, stdin: bytes | None = None) -> tuple[int, str]:
+    def _runner(script: str, *, timeout: float | None = None, stdin: bytes | None = None) -> tuple[int, str, str]:
         if stdin is None:
             cp = run_wsl_script(settings, script, check=False, timeout=timeout)
-            return cp.returncode, (cp.stdout or "")
-        remote = (
-            f"wsl -d {shlex.quote(settings.connection.distro)} -- "
-            f"env COLUMNS=120 LINES=40 bash -c {shlex.quote(script)}"
-        )
-        text = stdin.decode("utf-8") if isinstance(stdin, bytes) else stdin
-        cp = run(ssh_base_args(settings) + [remote], input_text=text, check=False, timeout=timeout)
-        return cp.returncode, (cp.stdout or "")
+            return cp.returncode, (cp.stdout or ""), (cp.stderr or "")
+        remote = wsl_shell_command(settings.connection.distro)
+        payload = bash_s_payload(script, stdin).decode("utf-8")
+        cp = run(ssh_base_args(settings) + [remote], input_text=payload, check=False, timeout=timeout)
+        return cp.returncode, (cp.stdout or ""), (cp.stderr or "")
     return _runner
 
 
@@ -1379,21 +1380,28 @@ def ensure_broker_installed(settings: Settings) -> None:
     """Upload or upgrade the WSL broker. wingpu is the only installer."""
     runner = broker_runner(settings)
     remote_dir = broker_remote_dir(settings)
-    status = broker_client.ensure_installed(runner, remote_dir, broker_script_bytes(), upgrade=True)
+    try:
+        status = broker_client.ensure_installed(runner, remote_dir, broker_script_bytes(), upgrade=True)
+    except broker_client.InstallError as exc:
+        raise WingpuError(str(exc)) from exc
     if status == "failed":
         raise WingpuError(f"Failed to install the GPU broker at {remote_dir}.")
     if status in {"installed", "upgraded"} or not _shutdown_helper_present(runner, remote_dir):
-        broker_client.install_shutdown_helper(
-            runner, remote_dir, broker_client.bundled_shutdown_helper_bytes(),
-        )
+        try:
+            broker_client.install_shutdown_helper(
+                runner, remote_dir, broker_client.bundled_shutdown_helper_bytes(),
+            )
+        except broker_client.InstallError as exc:
+            raise WingpuError(str(exc)) from exc
 
 
 def _shutdown_helper_present(runner, remote_dir: str) -> bool:
     script = f"test -f {shlex.quote(remote_dir)}/shutdown_helper.py && echo present || echo missing"
     try:
-        _rc, out = runner(script, timeout=20)
+        result = runner(script, timeout=20)
     except Exception:
         return False
+    out = result[1] if len(result) > 1 else ""
     return "present" in (out or "")
 
 
@@ -3099,11 +3107,13 @@ def main(argv: list[str] | None = None) -> int:
             elif args.broker_command == "install":
                 runner = broker_runner(settings)
                 remote_dir = broker_remote_dir(settings)
-                if not broker_client.install(runner, remote_dir, broker_script_bytes()):
-                    raise WingpuError(f"Failed to install the GPU broker at {remote_dir}.")
-                broker_client.install_shutdown_helper(
-                    runner, remote_dir, broker_client.bundled_shutdown_helper_bytes(),
-                )
+                try:
+                    broker_client.install(runner, remote_dir, broker_script_bytes())
+                    broker_client.install_shutdown_helper(
+                        runner, remote_dir, broker_client.bundled_shutdown_helper_bytes(),
+                    )
+                except broker_client.InstallError as exc:
+                    raise WingpuError(str(exc)) from exc
                 print(f"GPU broker installed at {remote_dir} on {settings.connection.host}.")
             elif args.broker_command == "events":
                 cmd_broker_events(settings, as_json=args.json, limit=args.limit, since=args.since)
