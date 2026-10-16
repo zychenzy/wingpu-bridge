@@ -194,7 +194,6 @@ It is fail-open (a broker problem never blocks a start) and can be turned off wi
 `gpu_broker.py`. Full details: [Project Guide, section 11](docs/README.md) and
 [the migration guide](docs/gpubroker-migration.md).
 
-The loopback GPU operations page lives in [zychenzy/gpu-dashboard](https://github.com/zychenzy/gpu-dashboard).
 
 ## Read This Next
 
@@ -230,7 +229,6 @@ These paths are intentionally kept out of git so the repo can stay publishable w
 - `bridge/config/`: publish-safe defaults and model catalog
 - `bridge/docs/`: durable project documentation
 - `bridge/gpubroker/`: shared broker package (broker, client, SSH relay, lease helpers)
-- GPU operations console: [zychenzy/gpu-dashboard](https://github.com/zychenzy/gpu-dashboard)
 - `bridge/mac/`: Python `wingpu` controller and utilities
 - `bridge/profiles/`: local profile templates
 - `bridge/windows/`: Windows-side setup scripts

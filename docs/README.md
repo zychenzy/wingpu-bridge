@@ -469,4 +469,3 @@ is not broker-aware. It does not install the GPU broker.
 
 ## 12. GPU dashboard
 
-The loopback GPU operations page has moved to [zychenzy/gpu-dashboard](https://github.com/zychenzy/gpu-dashboard).
