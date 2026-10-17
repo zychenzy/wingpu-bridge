@@ -195,6 +195,23 @@ It is fail-open (a broker problem never blocks a start) and can be turned off wi
 [the migration guide](docs/gpubroker-migration.md).
 
 
+## Upgrading llama.cpp (versioned, with rollback)
+
+Each llama.cpp version is built into its own git worktree in WSL,
+`~/src/llama.cpp/.worktrees/<tag>/build-cuda89`, and the runtime lanes run whatever
+`~/src/llama-current` points to (set in `~/.config/wingpu/wingpu.local.toml`).
+`~/src/llama-previous` is kept for rollback.
+
+```bash
+./update_llama.sh                # build latest master, switch llama-current, restart
+./update_llama.sh --no-switch    # build only (safe while the server is running)
+./update_llama.sh --ref b11706   # a specific tag
+./update_llama.sh --rollback     # swap current <-> previous and restart
+```
+
+History: b10454 (commit `4df29be4f`, 2026-08-16) was replaced by b11706 (`f74e2fa6a`)
+on 2026-10-17; rebuild an old one with `./update_llama.sh --ref 4df29be4f --no-switch`.
+
 ## Read This Next
 
 - [Project Guide](docs/README.md)
